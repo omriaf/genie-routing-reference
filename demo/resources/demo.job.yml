@@ -1,0 +1,15 @@
+resources:
+  jobs:
+    demo_seed:
+      name: ${bundle.name}-${bundle.target}-demo-seed
+      description: Replace synthetic sample tables and certified functions in the configured sample schema
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: seed
+          notebook_task:
+            notebook_path: ../generators/seed.py
+            source: WORKSPACE
+            base_parameters:
+              catalog: ${resources.dashboards.router_dashboard.dataset_catalog}
+              schema: ${resources.dashboards.router_dashboard.dataset_schema}
+              generators_dir: ${workspace.file_path}/demo/generators

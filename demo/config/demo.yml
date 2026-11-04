@@ -1,0 +1,54 @@
+# Offline template. Render with python -m demo.generators.prepare.
+# Replace every REPLACE_*_SPACE_ID in the rendered copy after Genie import.
+customer:
+  name: Sample Analytics
+  app_name: sample-analytics-router
+workspace:
+  catalog: {{ catalog | tojson }}
+  router_schema: {{ schema | tojson }}
+  warehouse_id: {{ warehouse_id | tojson }}
+  classifier_endpoint: {{ classifier_endpoint | tojson }}
+  mlflow_experiment: {{ experiment_path | tojson }}
+definitions:
+  repository_url: {{ repository_url | tojson }}
+  branch: {{ branch | tojson }}
+  markdown_path: demo/definitions
+  secret_scope: {{ secret_scope | tojson }}
+  secret_key: {{ secret_key | tojson }}
+  poll_seconds: 30
+routing:
+  confidence_threshold: 0.75
+  overlap_threshold: 0.70
+  prefer_certified_functions: true
+genie_agents:
+  - name: retail
+    description: Synthetic retail orders, completed revenue, and sales channels
+    space_id: REPLACE_RETAIL_SPACE_ID
+    routing_guidance: Route order volume, sales channels, and retail revenue here.
+  - name: support
+    description: Synthetic support tickets, priorities, and resolution times
+    space_id: REPLACE_SUPPORT_SPACE_ID
+    routing_guidance: Route ticket volume, priorities, and resolution hours here.
+  - name: marketing
+    description: Synthetic acquisition sessions, spend, and purchase conversion
+    space_id: REPLACE_MARKETING_SPACE_ID
+    routing_guidance: Route acquisition funnels, channel spend, and conversion here.
+uc_functions:
+  - name: monthly_revenue
+    full_name: {{ (catalog ~ '.' ~ schema ~ '.monthly_revenue') | tojson }}
+    domain: retail
+    description: Certified completed order revenue by month, excluding cancellations
+    aliases: [monthly revenue, completed sales]
+  - name: resolution_hours
+    full_name: {{ (catalog ~ '.' ~ schema ~ '.resolution_hours') | tojson }}
+    domain: support
+    description: Certified mean resolution hours over resolved support tickets
+    aliases: [average resolution hours, ticket resolution time]
+  - name: conversion_rate
+    full_name: {{ (catalog ~ '.' ~ schema ~ '.conversion_rate') | tojson }}
+    domain: marketing
+    description: Certified completed purchases divided by sessions for each channel
+    aliases: [purchase conversion rate, channel conversion]
+permissions:
+  app: []
+  dashboard: []
