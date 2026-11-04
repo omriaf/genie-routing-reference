@@ -14,6 +14,26 @@ import subprocess
 import sys
 
 
+_SECRET_KEYS = (
+    r"(?:DATABRICKS_|GITHUB_|ARM_|AZURE_)?(?:TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET|"
+    r"PASSWORD|API_KEY|SECRET_VALUE)|GITHUB_DEFINITIONS_TOKEN"
+)
+_PROFILE_KEYS = r"profile|DATABRICKS_CONFIG_PROFILE"
+
+
+def _assignments(keys: str) -> str:
+    # Quoted literals can appear in source as well as configuration. Bare values
+    # need configuration/shell boundaries so Python arguments/type annotations
+    # are not mistaken for private literal settings. Match inline JSON keys too.
+    key = (r"(?:\"(?:" + keys + r")\"|'(?:" + keys + r")'|(?:" + keys
+           + r"))[ \t]*[:=][ \t]*")
+    return (
+        r"(?<![\w.])" + key + r"[\"']([^\"'\r\n]+)[\"']|"
+        r"(?m:(?:^[ \t]*(?:export[ \t]+)?|[{][ \t]*|,[ \t]*(?=[\"']))"
+        + key + r"(?P<bare_value>[^\s\"'`,;#{}()[\]\\]+)(?=$|[ \t,}#;\r\n]))"
+    )
+
+
 RULES = {
     "email": re.compile(r"[A-Za-z0-9_.+%-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
     "home-path": re.compile(r"/(?:Users|home)/[^\s\"'`<>]+"),
@@ -34,15 +54,11 @@ RULES = {
         r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
     ),
     "private-key": re.compile(r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----"),
-    "secret-literal": re.compile(
-        r"(?i)[\"']?(?:DATABRICKS_TOKEN|GITHUB_TOKEN|GITHUB_DEFINITIONS_TOKEN|"
-        r"api_key|access_token|client_secret|password|secret_value)[\"']?\s*[:=]\s*"
-        r"[\"']([^\"'\n]+)[\"']",
-    ),
+    "secret-literal": re.compile(_assignments(_SECRET_KEYS), re.IGNORECASE),
     "profile-literal": re.compile(
         r"(?m:^(?:\s*|Examples: )(?:python|databricks)[^\n]*?--profile[ =]+[\"']?([A-Za-z0-9_.-]+))|"
         r"--profile[\"']\s*,\s*[\"']([A-Za-z0-9_<][^\"'\n]*)[\"']|"
-        r"(?i:profile|DATABRICKS_CONFIG_PROFILE)[\"']?\s*[:=]\s*[\"']([^\"'\n]+)[\"']",
+        + _assignments(_PROFILE_KEYS), re.IGNORECASE,
     ),
     "resource-id": re.compile(
         r"(?i:[\"']?(?:workspace_id|warehouse_id|space_id|account_id)[\"']?)\s*[:=]\s*"
@@ -58,7 +74,9 @@ SYNTHETIC = {
     "profile-literal": {"chosen", "selected", "NAME", "NAME.", "test-profile", "sync-test",
                         "<PROFILE>", "<your-selected-profile>"},
     "secret-literal": {"TOKEN", "PLACEHOLDER", "REJECTED_TEST_PLACEHOLDER",
-                       "synthetic-secret-in-backend-error", "ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE"},
+                       "<PASSWORD>", "<CLIENT_SECRET>", "<API_KEY>", "<TOKEN>",
+                       "synthetic-secret-in-backend-error", "ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE",
+                       "synthetic-bound-token-DO-NOT-LOG"},
     "resource-id": {"abc123", "987abc", "warehouse123", "offlinewarehouse", "space-123", "not", "has", "f",
                     "01abc", "g", "0", "REPLACE_RETAIL_SPACE_ID",
                     "REPLACE_SUPPORT_SPACE_ID", "REPLACE_MARKETING_SPACE_ID",
@@ -83,6 +101,8 @@ def scan_text(contents: str, location: str, denied: tuple[str, ...] = ()) -> lis
     for rule, pattern in RULES.items():
         for match in pattern.finditer(contents):
             value = next((group for group in match.groups() if group is not None), match[0])
+            if match.groupdict().get("bare_value") in {"null", "None", "~"}:
+                continue  # Explicit unconfigured/null markers, never quoted literals.
             if rule == "email" and (
                 value.rsplit("@", 1)[1].lower() in {"example.com", "example.org", "example.net"}
                 or value in {"omriaf@users.noreply.github.com", "placeholder@github.com",
@@ -91,7 +111,12 @@ def scan_text(contents: str, location: str, denied: tuple[str, ...] = ()) -> lis
             ):
                 continue
             if value in SYNTHETIC.get(rule, set()):
-                continue
+                # A quoted placeholder followed by shell concatenation is a
+                # different value, not an allowed placeholder.
+                if rule not in {"secret-literal", "profile-literal"} or (
+                    match.end() == len(contents) or contents[match.end()] in " \t\r\n,]}):;#"
+                ):
+                    continue
             findings.append(Finding(location, rule, contents.count("\n", 0, match.start()) + 1))
     return findings
 

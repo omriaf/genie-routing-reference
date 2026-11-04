@@ -67,7 +67,8 @@ scan, 1 for findings, and 2 when the scan cannot complete.
 Rules detect personal email addresses, local home paths, workspace/App hosts,
 internal host/source/transcript markers, literal workspace/resource IDs and
 profiles, common Databricks/GitHub/AWS/Slack/JWT credentials, private-key headers,
-quoted secret assignments and private configuration paths. They are heuristic:
+quoted and unquoted credential/profile assignments in YAML, dotenv, shell,
+JSON/TOML-style settings, and private configuration paths. They are heuristic:
 new credential formats, arbitrary business prose, encodings, encrypted archives,
 unreachable/reflog-only objects, external repos and local Git configuration are
 outside the gate. A human still reviews the public diff and reachable history.
@@ -91,7 +92,7 @@ file, directory or entire rule, and never waive a token/private-key match:
 | Email | Any mailbox on reserved `example.com`, `example.org`, `example.net`; exact invalid-URL fixtures `placeholder@github.com`, `password@github.com`, `git@github.com`, `secret@api.github.com`, `github.com@evil.test` |
 | Public attribution | Exact GitHub privacy address `omriaf@users.noreply.github.com`, already used for this public source's commits; this is public author metadata, not an internal identity |
 | Profile | `chosen`, `selected`, `test-profile`, `sync-test` in offline CLI doubles (the last is a temporary loopback mock); `NAME`, `NAME.`, `<PROFILE>` and `<your-selected-profile>` in current/historical usage examples. These angle-bracket values are unconfigured examples, not profiles |
-| Secret assignment | `TOKEN`, `PLACEHOLDER`, `REJECTED_TEST_PLACEHOLDER`, `synthetic-secret-in-backend-error`, `ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE` are inert regression-test sentinels |
+| Secret assignment | `TOKEN`, `PLACEHOLDER`, `REJECTED_TEST_PLACEHOLDER`, `synthetic-secret-in-backend-error`, `ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE`, `synthetic-bound-token-DO-NOT-LOG` are inert regression-test sentinels; exact `<PASSWORD>`, `<CLIENT_SECRET>`, `<API_KEY>`, `<TOKEN>` are unconfigured examples |
 | Resource ID | `abc123`, `987abc`, `warehouse123`, `offlinewarehouse`, `space-123`; intentionally invalid input fragments `not`, `has`, `01abc`, `g`, `0`, and the repeated-hex source fragment `f` |
 | Genie ID | Exact synthetic `01abc000000000000000000000000001`, `01abc000000000000000000000000002`; unconfigured demo markers `REPLACE_RETAIL_SPACE_ID`, `REPLACE_SUPPORT_SPACE_ID`, `REPLACE_MARKETING_SPACE_ID` |
 
@@ -99,6 +100,9 @@ Negative scanner fixtures construct rejected values at runtime instead of
 checking credential-shaped strings into source. Extending an exception requires
 an exact inert value, a documented reason here, and a regression test proving a
 nearby real-looking value still fails.
+Unquoted `null`, `None` and `~` are explicit no-value markers. Their quoted forms
+remain ordinary literals and fail. There is no wildcard placeholder exemption:
+adding private text to an allowed placeholder also fails.
 
 ## Live smoke tool: separately gated
 
@@ -149,11 +153,23 @@ origin must end in the Databricks Apps domain; redirects and ambient HTTP proxy
 settings are disabled. The HTTP/MCP path uses the selected profile's auth
 headers; profile authentication must support App invocation. Authentication
 failures stop the tool rather than switching profiles or prompting for tokens.
-Competing `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, client ID/secret, auth type,
-account ID or Azure resource ID environment overrides also stop before client
-construction; unset those inputs locally so unified auth uses the selected
-profile. Their values are never printed. An ambient profile name is never used
-as a substitute for the explicit argument.
+Competing authentication selectors stop before either SDK/MLflow client is
+constructed. The central guard follows the documented
+[unified-auth environment fields](https://docs.databricks.com/dev-tools/auth/env-vars.html)
+and SDK credential suppliers. It rejects **all `DATABRICKS_*` variables**, including
+host, profile/config-file selection, workspace/account/cloud IDs, PAT/OAuth/OIDC,
+runtime discovery and future fields. It also rejects the `ARM_*`, `AZURE_*`,
+`GOOGLE_*`, `GCLOUD_*`, `CLOUDSDK_*`, `AWS_*`, `ACTIONS_ID_TOKEN_*`, `IDENTITY_*`,
+`MSI_*` and `DB_MODEL_SERVING_*` namespaces; the SDK's Azure DevOps `SYSTEM_*`
+OIDC inputs; model-serving credential-directory/context flags; and legacy
+`_OAUTH_TOKEN`/`_OAUTH_TOKEN_EXPIRATION` cache selectors. This intentionally fails
+closed across credential namespaces, even if a particular key appears harmless.
+Unset those inputs locally before using the selected profile. Only environment
+**names** are inspected; values are neither read nor printed, and the guard does
+not mutate the environment. Unrelated settings such as `PATH`, `LANG`, `TMPDIR`
+and application-specific settings survive unchanged. Tests independently inject
+known omitted selectors, test future namespace fields and check every installed
+SDK Config environment field/alias without constructing Config or authenticating.
 
 Assertions cover MCP discovery, every configured Genie domain, certified routing
 policy and known results, explicit refusal status, exact alias enrichment,

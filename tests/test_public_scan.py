@@ -174,3 +174,82 @@ def test_allowlist_values_have_documented_reasons():
     documentation = (Path(__file__).resolve().parents[1] / "validation/README.md").read_text()
     for values in scan.SYNTHETIC.values():
         assert all(f"`{value}`" in documentation for value in values)
+
+
+ASSIGNMENT_CASES = (
+    ("profile", "profile-literal"),
+    ("DATABRICKS_CONFIG_PROFILE", "profile-literal"),
+    ("password", "secret-literal"),
+    ("DATABRICKS_CLIENT_SECRET", "secret-literal"),
+    ("ARM_CLIENT_SECRET", "secret-literal"),
+    ("api_key", "secret-literal"),
+    ("access_token", "secret-literal"),
+    ("refresh_token", "secret-literal"),
+)
+
+
+@pytest.mark.parametrize("key,rule", ASSIGNMENT_CASES)
+@pytest.mark.parametrize("template", (
+    "{key}: {value}", "{key}={value}", "export {key}={value}",
+    '{{"{key}": {value}}}', '{key} = {value} # private setting',
+    "'{key}' = '{value}'", '"{key}" = "{value}"',
+    '{{"safe": 1, "{key}": {value}}}', "{key}={value} command", "{key}={value}; command",
+))
+def test_private_assignments_are_detected_and_redacted(key, rule, template):
+    value = "private-" + "assignment-sentinel"
+    payload = template.format(key=key, value=value)
+    findings = scan.scan_text(payload, "synthetic")
+    assert rule in {finding.rule for finding in findings}
+    assert value not in repr(findings)
+
+
+@pytest.mark.parametrize("payload", (
+    "profile: <PROFILE>", "DATABRICKS_CONFIG_PROFILE=<PROFILE>",
+    "password: <PASSWORD>", "export DATABRICKS_CLIENT_SECRET=<CLIENT_SECRET>",
+    '{"password": "<PASSWORD>"}', "api_" + 'key = "<API_KEY>"',
+    "access_token: PLACEHOLDER", "refresh_token: <TOKEN>",
+    "password: null", "password = None", "profile: ~",
+))
+def test_explicit_unconfigured_assignment_placeholders_are_allowed(payload):
+    assert scan.scan_text(payload, "synthetic") == []
+
+
+@pytest.mark.parametrize("key,value", (
+    ("profile", "<PROFILE>-private"), ("password", "<PASSWORD>-private"),
+    ("password", "<UNREVIEWED_PLACEHOLDER>"), ("password", '"null"'),
+    ("password", '"None"'), ("profile", '"~"'),
+))
+def test_nearby_and_undocumented_assignment_values_are_not_exempted(key, value):
+    assert scan.scan_text(key + ": " + value, "synthetic")
+
+
+@pytest.mark.parametrize("key,placeholder", (("profile", "<PROFILE>"), ("password", "<PASSWORD>")))
+def test_shell_concatenation_cannot_launder_placeholders(key, placeholder):
+    assert scan.scan_text(key + '="' + placeholder + '"private', "synthetic")
+
+
+def test_python_expressions_and_type_annotations_are_not_private_literals():
+    assert scan.scan_text(
+        'def create(profile: str):\n'
+        '    return WorkspaceClient(profile=profile)\n'
+        'token = os.environ.get("SAFE_TOKEN_REFERENCE")\n', "synthetic",
+    ) == []
+
+
+@pytest.mark.parametrize("key,rule", ASSIGNMENT_CASES)
+def test_unquoted_assignments_fail_in_worktree_index_and_deleted_history(repository, key, rule, capsys):
+    value = "private-" + "assignment-sentinel"
+    path = repository / "settings.txt"
+    path.write_text(key + "=" + value + "\n")
+    git(repository, "add", "settings.txt")
+    findings, _ = scan.scan_repository(repository)
+    assert any(f.rule == rule and f.location.startswith("tracked:") for f in findings)
+    assert any(f.rule == rule and f.location.startswith("index:") for f in findings)
+    git(repository, "commit", "-m", "Temporary settings")
+    git(repository, "rm", "settings.txt")
+    git(repository, "commit", "-m", "Remove temporary settings")
+    findings, _ = scan.scan_repository(repository)
+    assert any(f.rule == rule and f.location.startswith("blob:") for f in findings)
+    assert scan.main(["--root", str(repository)]) == 1
+    output = capsys.readouterr()
+    assert value not in output.out + output.err

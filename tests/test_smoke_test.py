@@ -290,8 +290,8 @@ def test_live_adapter_uses_selected_profile_and_correlates_evidence(monkeypatch,
     import databricks.sdk
     from mlflow.tracking import MlflowClient
 
-    for key in smoke.AUTH_ENVIRONMENT_OVERRIDES:
-        monkeypatch.delenv(key, raising=False)
+    safe_environment = {"PATH": smoke.os.defpath, "LANG": "C", "ROUTER_SMOKE_SETTING": "safe"}
+    monkeypatch.setattr(smoke.os, "environ", dict(safe_environment))
     profile_calls, sql_calls, trace_calls = [], [], []
     case = smoke.Plan.model_validate(plan_document).cases[0]
     answer = answer_for(case, runtime)
@@ -303,12 +303,14 @@ def test_live_adapter_uses_selected_profile_and_correlates_evidence(monkeypatch,
         return {"status": {"state": "SUCCEEDED"}, "result": {"data_array": [[json.dumps(row)]]}}
 
     def workspace_client(*, profile):
+        assert dict(smoke.os.environ) == safe_environment
         profile_calls.append(profile)
         return SimpleNamespace(api_client=SimpleNamespace(do=query),
                                config=SimpleNamespace(authenticate=lambda: {"Authorization": "Bearer PLACEHOLDER"}))
 
     class Tracking:
         def __init__(self, *, tracking_uri):
+            assert dict(smoke.os.environ) == safe_environment
             profile_calls.append(tracking_uri)
 
         def get_experiment_by_name(self, path):
@@ -351,13 +353,49 @@ def test_live_adapter_uses_selected_profile_and_correlates_evidence(monkeypatch,
     assert trace_calls[0]["experiment_ids"] == ["synthetic-experiment"]
     assert all(request.url.path in {"/health", "/mcp"} for request in requests)
     assert MlflowClient is not Tracking
+    assert dict(smoke.os.environ) == safe_environment
 
 
-@pytest.mark.parametrize("key", sorted(smoke.AUTH_ENVIRONMENT_OVERRIDES))
+# Deliberately independent of the production guard's names/prefixes.
+@pytest.mark.parametrize("key", (
+    "ARM_CLIENT_ID", "ARM_CLIENT_SECRET", "ARM_TENANT_ID", "ARM_ENVIRONMENT", "ARM_USE_MSI",
+    "DATABRICKS_WORKSPACE_ID", "DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_CLIENT_ID",
+    "DATABRICKS_CLIENT_SECRET", "DATABRICKS_AUTH_TYPE", "DATABRICKS_ACCOUNT_ID",
+    "DATABRICKS_CONFIG_PROFILE", "DATABRICKS_CONFIG_FILE", "DATABRICKS_AZURE_RESOURCE_ID",
+    "DATABRICKS_USERNAME", "DATABRICKS_PASSWORD", "DATABRICKS_CLOUD", "DATABRICKS_DISCOVERY_URL",
+    "DATABRICKS_OIDC_TOKEN", "DATABRICKS_OIDC_TOKEN_ENV", "DATABRICKS_OIDC_TOKEN_FILEPATH",
+    "DATABRICKS_OIDC_TOKEN_FILE", "DATABRICKS_METADATA_SERVICE_URL", "DATABRICKS_CLI_PATH",
+    "DATABRICKS_RUNTIME_VERSION", "DATABRICKS_FUTURE_AUTH_SELECTOR",
+    "GOOGLE_CREDENTIALS", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+    "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_TENANT_ID", "AZURE_CONFIG_DIR",
+    "AZURE_FEDERATED_TOKEN_FILE", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL",
+    "SYSTEM_ACCESSTOKEN", "SYSTEM_TEAMFOUNDATIONCOLLECTIONURI", "SYSTEM_TEAMPROJECTID",
+    "SYSTEM_PLANID", "SYSTEM_JOBID", "SYSTEM_HOSTTYPE", "CLOUDSDK_CONFIG",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "IDENTITY_ENDPOINT", "MSI_ENDPOINT",
+    "SERVING_CREDENTIALS_DIR", "IS_IN_DB_MODEL_SERVING_ENV", "IS_IN_DATABRICKS_MODEL_SERVING_ENV",
+    "DB_MODEL_SERVING_HOST_URL", "_OAUTH_TOKEN", "_OAUTH_TOKEN_EXPIRATION",
+))
 def test_ambient_auth_cannot_override_explicit_profile(monkeypatch, runtime, plan_document, key):
-    monkeypatch.setenv(key, "PLACEHOLDER")
-    with pytest.raises(smoke.SmokeFailure, match="ambient auth"):
+    import databricks.sdk
+
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: pytest.fail("client construction before guard"))
+    # Replace the mapping with a single competing selector: other ambient
+    # settings cannot mask this regression. Never inspect real credential values.
+    monkeypatch.setattr(smoke.os, "environ", {key: "PRIVATE_ENV_SENTINEL", "LANG": "C"})
+    with pytest.raises(smoke.SmokeFailure, match="ambient auth") as error:
         smoke.LiveBackend("test-profile", smoke.Plan.model_validate(plan_document), runtime)
+    assert "PRIVATE_ENV_SENTINEL" not in str(error.value)
+    assert key not in str(error.value)
+
+
+def test_guard_covers_all_sdk_environment_fields_without_initializing_config():
+    from databricks.sdk.config import Config, ConfigAttribute
+
+    for field in vars(Config).values():
+        if isinstance(field, ConfigAttribute):
+            for name in (field.env, *getattr(field, "env_aliases", ())):
+                if name:
+                    assert smoke.is_auth_environment_selector(name), name
 
 
 def test_main_redacts_external_errors_and_closes_backend(plan_file, monkeypatch, capsys):

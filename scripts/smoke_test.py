@@ -175,7 +175,7 @@ class LiveBackend:
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", profile), "explicit profile")
         # Unified auth merges environment fields before profile fields. Fail on
         # competing auth inputs rather than silently contacting another host.
-        require(not AUTH_ENVIRONMENT_OVERRIDES.intersection(os.environ),
+        require(not any(is_auth_environment_selector(name) for name in os.environ),
                 "remove ambient auth overrides before using the selected profile")
         import httpx
         from databricks.sdk import WorkspaceClient
@@ -258,10 +258,24 @@ class LiveBackend:
         self.http.close()
 
 
+# Unified-auth field names and aliases are documented at:
+# https://docs.databricks.com/dev-tools/auth/env-vars.html
+# Prefixes cover current/future SDK Config fields, cloud credential libraries,
+# OIDC suppliers and runtime/model-serving discovery. No values are read here.
+AUTH_ENVIRONMENT_PREFIXES = (
+    "DATABRICKS_", "ARM_", "AZURE_", "GOOGLE_", "GCLOUD_", "CLOUDSDK_", "AWS_",
+    "ACTIONS_ID_TOKEN_", "IDENTITY_", "MSI_", "DB_MODEL_SERVING_",
+)
 AUTH_ENVIRONMENT_OVERRIDES = {
-    "DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET",
-    "DATABRICKS_AUTH_TYPE", "DATABRICKS_ACCOUNT_ID", "DATABRICKS_AZURE_RESOURCE_ID",
+    "SYSTEM_ACCESSTOKEN", "SYSTEM_TEAMFOUNDATIONCOLLECTIONURI", "SYSTEM_TEAMPROJECTID",
+    "SYSTEM_PLANID", "SYSTEM_JOBID", "SYSTEM_HOSTTYPE",
+    "SERVING_CREDENTIALS_DIR", "IS_IN_DB_MODEL_SERVING_ENV", "IS_IN_DATABRICKS_MODEL_SERVING_ENV",
+    "_OAUTH_TOKEN", "_OAUTH_TOKEN_EXPIRATION",
 }
+
+
+def is_auth_environment_selector(name: str) -> bool:
+    return name.startswith(AUTH_ENVIRONMENT_PREFIXES) or name in AUTH_ENVIRONMENT_OVERRIDES
 
 
 def run_checks(backend, plan: Plan, runtime: RuntimeConfig):
