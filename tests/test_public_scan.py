@@ -253,3 +253,104 @@ def test_unquoted_assignments_fail_in_worktree_index_and_deleted_history(reposit
     assert scan.main(["--root", str(repository)]) == 1
     output = capsys.readouterr()
     assert value not in output.out + output.err
+
+
+LEADING_CONTEXT_MUTATIONS = (
+    "- {key}: {value}", "    - {key}: {value}", "  - - {key}: {value}",
+    "    {key}: {value}", "    {key}={value}", "export {key}={value}",
+    "env {key}={value} command", "/usr/bin/env {key}={value} command",
+    "command env {key}={value} command", "sudo -u sample env {key}={value} command",
+    "env -u SAFE_SETTING {key}={value} command", "env -- {key}={value} command",
+    "true; export {key}={value}", "true;export {key}={value}",
+    "true && export {key}={value}", "true&&env {key}={value} command",
+    "false || export {key}={value}", "false||env {key}={value} command",
+    "true | env {key}={value} command", "true & env {key}={value} command",
+    "( env {key}={value} command )", "SAFE_SETTING=value {key}={value} command",
+    "env SAFE_SETTING=value {key}={value} SECOND_SETTING=value command",
+    "true; SAFE_SETTING=value {key}={value} command",
+    "export SAFE_SETTING=value {key}={value}; command",
+    "{{ env {key}={value} command; }}", "if true; then export {key}={value}; fi",
+    "while {key}={value} command; do true; done", "until {key}={value} command; do true; done",
+    "if true; then true; else env {key}={value} command; fi", "! env {key}={value} command",
+    "command -p env {key}={value} command", "exec -a sample env {key}={value} command",
+    "readonly SAFE_SETTING {key}={value}", "declare -x {key}={value}",
+    "env SAFE_SETTING=value \\\n    {key}={value} command",
+    '{{safe: value, {key}: {value}}}', '[{{"{key}": {value}}}]',
+    '[credentials]\n{key} = {value}',
+)
+
+
+@pytest.mark.parametrize("key,rule", (
+    ("profile", "profile-literal"), ("password", "secret-literal"),
+    ("DATABRICKS_CLIENT_SECRET", "secret-literal"),
+))
+@pytest.mark.parametrize("template", LEADING_CONTEXT_MUTATIONS)
+def test_assignment_leading_context_mutations(template, key, rule):
+    value = "review-synthetic-" + "private-value"
+    findings = scan.scan_text(template.format(key=key, value=value), "synthetic")
+    assert rule in {finding.rule for finding in findings}
+    assert value not in repr(findings)
+
+
+@pytest.mark.parametrize("key,value", (("profile", "<PROFILE>"), ("password", "<PASSWORD>")))
+@pytest.mark.parametrize("template", LEADING_CONTEXT_MUTATIONS)
+def test_leading_contexts_preserve_only_exact_placeholders(template, key, value):
+    assert not scan.scan_text(template.format(key=key, value=value), "synthetic")
+    assert scan.scan_text(template.format(key=key, value=value + "-private"), "synthetic")
+
+
+@pytest.mark.parametrize("prose", (
+    "The profile: setting is discussed in this sentence.",
+    "Documentation describes password: value as a phrase.",
+    "Use password=value when describing the syntax.",
+    "The phrase env DATABRICKS_CLIENT_SECRET=value is a prose example.",
+    "A bullet describes - profile: value within prose.",
+    "echo password=value", "echo 'env password=value'",
+))
+def test_assignment_words_in_prose_are_not_indiscriminately_flagged(prose):
+    assert not scan.scan_text(prose, "synthetic")
+
+
+@pytest.mark.parametrize("key,placeholder", (("profile", "<PROFILE>"), ("password", "<PASSWORD>")))
+def test_yaml_placeholder_must_cover_the_entire_plain_scalar(key, placeholder):
+    for template in ("- {key}: {value}", "{{safe: value, {key}: {value}}}"):
+        assert not scan.scan_text(template.format(key=key, value=placeholder + " # comment"), "synthetic")
+        assert scan.scan_text(template.format(key=key, value=placeholder + " private-suffix"), "synthetic")
+
+
+@pytest.mark.parametrize("prefix", ("", "env ", "true; export "))
+def test_shell_continuations_cannot_launder_placeholder_prefixes(prefix):
+    value = "PLACEHOLDER" + "\\\nprivate-suffix"
+    findings = scan.scan_text(prefix + "pass" + "word=" + value + " command", "synthetic")
+    assert "secret-literal" in {finding.rule for finding in findings}
+    assert value not in repr(findings)
+
+
+def test_every_leading_context_is_scanned_in_index_worktree_and_deleted_blobs(repository, capsys):
+    value = "review-synthetic-" + "private-value"
+    rows = [(template.format(key=key, value=value), rule)
+            for template in LEADING_CONTEXT_MUTATIONS
+            for key, rule in (("profile", "profile-literal"), ("password", "secret-literal"),
+                              ("DATABRICKS_CLIENT_SECRET", "secret-literal"))]
+    contents = "\n".join(row for row, _ in rows) + "\n"
+    expected = set()
+    line = 1
+    for row, rule in rows:
+        expected.add((rule, line + (1 if "\\\n" in row or row.startswith("[credentials]") else 0)))
+        line += row.count("\n") + 1
+    # Expected rules/physical line numbers do not come from the scanner itself.
+    assert len(expected) == len(rows)
+    path = repository / "settings.txt"
+    path.write_text(contents)
+    git(repository, "add", "settings.txt")
+    findings, _ = scan.scan_repository(repository)
+    for boundary in ("tracked:", "index:"):
+        assert expected <= {(item.rule, item.line) for item in findings if item.location.startswith(boundary)}
+    git(repository, "commit", "-m", "Temporary mutation settings")
+    git(repository, "rm", "settings.txt")
+    git(repository, "commit", "-m", "Remove mutation settings")
+    findings, _ = scan.scan_repository(repository)
+    assert expected <= {(item.rule, item.line) for item in findings if item.location.startswith("blob:")}
+    assert scan.main(["--root", str(repository)]) == 1
+    output = capsys.readouterr()
+    assert value not in output.out + output.err

@@ -73,6 +73,19 @@ new credential formats, arbitrary business prose, encodings, encrypted archives,
 unreachable/reflog-only objects, external repos and local Git configuration are
 outside the gate. A human still reviews the public diff and reachable history.
 
+Unquoted assignment checks tokenize configuration mappings and shell command
+positions rather than requiring a key at the start of a line. Coverage includes
+indented/nested YAML list mappings, flow collections, multiple shell assignments,
+`env`/`export` and common command prefixes, control/grouping constructs, line
+continuations, and `;`, `&&`, `||`, pipe and background separators. Tokens are
+inspected offline; shell text is never expanded or executed. Ordinary prose
+mentions and command arguments are not treated as assignment positions. Quoted
+credential/profile literals remain checked independently, including in source.
+The same detection applies to tracked files, the index and deleted history.
+Only an entire scalar/assignment value may equal a documented placeholder;
+extra words or concatenated private text invalidate the exemption. This is a
+heuristic gate, not a complete YAML or shell interpreter.
+
 For additional **known** non-secret environment values, manually prepare
 `validation/local/deny-values.txt` with one literal per line (at least four
 characters; no comments). Add workspace IDs, internal profile names or customer

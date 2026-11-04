@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 
@@ -21,17 +22,160 @@ _SECRET_KEYS = (
 _PROFILE_KEYS = r"profile|DATABRICKS_CONFIG_PROFILE"
 
 
-def _assignments(keys: str) -> str:
-    # Quoted literals can appear in source as well as configuration. Bare values
-    # need configuration/shell boundaries so Python arguments/type annotations
-    # are not mistaken for private literal settings. Match inline JSON keys too.
+def _quoted_assignments(keys: str) -> str:
+    # Preserve source-literal detection, independently of configuration grammar.
     key = (r"(?:\"(?:" + keys + r")\"|'(?:" + keys + r")'|(?:" + keys
            + r"))[ \t]*[:=][ \t]*")
-    return (
-        r"(?<![\w.])" + key + r"[\"']([^\"'\r\n]+)[\"']|"
-        r"(?m:(?:^[ \t]*(?:export[ \t]+)?|[{][ \t]*|,[ \t]*(?=[\"']))"
-        + key + r"(?P<bare_value>[^\s\"'`,;#{}()[\]\\]+)(?=$|[ \t,}#;\r\n]))"
-    )
+    return r"(?<![\w.])" + key + r"[\"']([^\"'\r\n]+)[\"']"
+
+
+_ASSIGNMENT_KEYS = {
+    "secret-literal": re.compile(r"(?:" + _SECRET_KEYS + r")\Z", re.IGNORECASE),
+    "profile-literal": re.compile(r"(?:" + _PROFILE_KEYS + r")\Z", re.IGNORECASE),
+}
+_KEY_HINT = re.compile(r"\b(?:" + _SECRET_KEYS + "|" + _PROFILE_KEYS + r")[\"']?[ \t]*[:=]", re.IGNORECASE)
+_QUOTED_WORD = r'"(?:\\.|[^"\\])*"' + "|" + r"'[^']*'"
+_CONFIG_TOKENS = re.compile(_QUOTED_WORD + r"|[{}\[\],:=()]|[^\s{}\[\],:=()]+")
+_BARE_SCALAR = re.compile(r"[^\s\"'`,;{}()[\]&|]+")
+# Shell words retain quoting/escaping until shlex decodes one word. Operators
+# are separate tokens even without spaces. Nothing is expanded or executed.
+_SHELL_TOKENS = re.compile(
+    r'''&&|\|\||[;&|()]|(?:[^\s;&|()'"\\]+|\\(?:\r?\n|[^\r\n])|"(?:\\[\s\S]|[^"\\])*"|'[^']*')+'''
+)
+_SHELL_PREFIXES = {"env", "export", "readonly", "declare", "typeset", "local",
+                   "exec", "command", "builtin", "sudo", "nohup", "time"}
+_DECLARATIONS = {"export", "readonly", "declare", "typeset", "local"}
+_CONTROL_PREFIXES = {"if", "then", "elif", "else", "while", "until", "do", "!", "{"}
+_OPTION_ARGUMENTS = {
+    "env": {"-u", "--unset", "-C", "--chdir"},
+    "sudo": {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt"},
+    "time": {"-f", "--format", "-o", "--output"},
+    "exec": {"-a"},
+}
+
+
+def _assignment_rule(key: str) -> str | None:
+    for rule, pattern in _ASSIGNMENT_KEYS.items():
+        if pattern.fullmatch(key):
+            return rule
+    return None
+
+
+def _logical_lines(contents: str):
+    start, pending = 0, ""
+    for line in contents.splitlines(keepends=True):
+        pending += line
+        if line.endswith(("\\\n", "\\\r\n")):
+            continue
+        yield start, pending
+        start += len(pending)
+        pending = ""
+    if pending:
+        yield start, pending
+
+
+def _mapping_assignments(line: str):
+    tokens = list(_CONFIG_TOKENS.finditer(line))
+    containers = []
+    for index, token in enumerate(tokens):
+        word = token[0]
+        if word.startswith("#"):
+            break
+        if word in {"{", "["}:
+            containers.append(word)
+        elif word in {"}", "]"} and containers:
+            containers.pop()
+        key = word[1:-1] if word.startswith(('"', "'")) else word
+        rule = _assignment_rule(key)
+        if rule is None or index + 1 == len(tokens) or tokens[index + 1][0] not in {":", "="}:
+            continue
+        # A block/list mapping key, or a key within a flow collection. A comma
+        # in ordinary prose or a Python call is not a mapping boundary.
+        block_key = all(previous[0] == "-" for previous in tokens[:index])
+        flow_key = bool(containers) and index > 0 and tokens[index - 1][0] in {"{", "[", ","}
+        if not (block_key or flow_key):
+            continue
+        value_start = tokens[index + 1].end()
+        while value_start < len(line) and line[value_start] in " \t":
+            value_start += 1
+        value = _BARE_SCALAR.match(line, value_start)
+        if value is None or (value.end() < len(line) and line[value.end()] == "("):
+            continue  # Quoted literals are checked separately; calls are not scalars.
+        scalar = value[0]
+        if tokens[index + 1][0] == ":":
+            # YAML plain scalars can contain spaces. Only the whole value may
+            # equal a placeholder; a safe first word cannot hide private text.
+            scalar = line[value_start:].splitlines()[0]
+            if flow_key:
+                scalar = re.split(r"[,}\]]", scalar, maxsplit=1)[0]
+            scalar = re.split(r"[ \t]+#", scalar, maxsplit=1)[0].strip()
+        yield rule, scalar, True, token.start()
+
+
+def _shell_assignments(line: str):
+    tokens = list(_SHELL_TOKENS.finditer(line))
+    assignment_position, prefix, option_argument = True, None, False
+    for index, token in enumerate(tokens):
+        raw = token[0]
+        if raw.startswith("#"):
+            break
+        if raw in {"\\\n", "\\\r\n"}:
+            continue
+        if raw in {";", "&&", "||", "|", "&"}:
+            assignment_position, prefix, option_argument = True, None, False
+            continue
+        if raw == "(":
+            continue  # Grouping preserves command position; function calls do not reset it.
+        if raw == ")":
+            assignment_position = False
+        if not assignment_position:
+            continue
+        if raw in _CONTROL_PREFIXES:
+            prefix, option_argument = None, False
+            continue
+        try:
+            words = shlex.split(raw, comments=False, posix=True)
+        except ValueError:
+            continue
+        if len(words) != 1:
+            continue
+        word = words[0]
+        if option_argument:
+            option_argument = False
+            continue
+        if prefix and word.startswith("-"):
+            option_argument = word in _OPTION_ARGUMENTS.get(prefix, set())
+            continue
+        key, separator, value = word.partition("=")
+        if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and (
+            prefix == "env" or not raw.startswith(('"', "'"))
+        ):
+            # Parentheses adjacent to an unquoted value indicate a source call,
+            # not a syntactically valid shell assignment.
+            if index + 1 < len(tokens) and tokens[index + 1][0] == "(" and token.end() == tokens[index + 1].start():
+                assignment_position = False
+                continue
+            rule = _assignment_rule(key)
+            if rule is not None and value:
+                raw_value = raw.partition("=")[2]
+                yield rule, value, not raw_value.startswith(('"', "'")), token.start()
+            continue  # Subsequent assignments remain in command position.
+        command = word.rsplit("/", 1)[-1]
+        if command in _SHELL_PREFIXES:
+            prefix = command
+        elif prefix not in _DECLARATIONS or not word.isidentifier():
+            assignment_position = False
+
+
+def _structured_assignment_findings(contents: str, location: str):
+    for start, line in _logical_lines(contents):
+        if not _KEY_HINT.search(line):
+            continue
+        for parse in (_mapping_assignments, _shell_assignments):
+            for rule, value, bare, offset in parse(line):
+                if (bare and value in {"null", "None", "~"}) or value in SYNTHETIC[rule]:
+                    continue
+                yield Finding(location, rule, contents.count("\n", 0, start + offset) + 1)
 
 
 RULES = {
@@ -54,11 +198,11 @@ RULES = {
         r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
     ),
     "private-key": re.compile(r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----"),
-    "secret-literal": re.compile(_assignments(_SECRET_KEYS), re.IGNORECASE),
+    "secret-literal": re.compile(_quoted_assignments(_SECRET_KEYS), re.IGNORECASE),
     "profile-literal": re.compile(
         r"(?m:^(?:\s*|Examples: )(?:python|databricks)[^\n]*?--profile[ =]+[\"']?([A-Za-z0-9_.-]+))|"
         r"--profile[\"']\s*,\s*[\"']([A-Za-z0-9_<][^\"'\n]*)[\"']|"
-        + _assignments(_PROFILE_KEYS), re.IGNORECASE,
+        + _quoted_assignments(_PROFILE_KEYS), re.IGNORECASE,
     ),
     "resource-id": re.compile(
         r"(?i:[\"']?(?:workspace_id|warehouse_id|space_id|account_id)[\"']?)\s*[:=]\s*"
@@ -101,8 +245,6 @@ def scan_text(contents: str, location: str, denied: tuple[str, ...] = ()) -> lis
     for rule, pattern in RULES.items():
         for match in pattern.finditer(contents):
             value = next((group for group in match.groups() if group is not None), match[0])
-            if match.groupdict().get("bare_value") in {"null", "None", "~"}:
-                continue  # Explicit unconfigured/null markers, never quoted literals.
             if rule == "email" and (
                 value.rsplit("@", 1)[1].lower() in {"example.com", "example.org", "example.net"}
                 or value in {"omriaf@users.noreply.github.com", "placeholder@github.com",
@@ -114,10 +256,11 @@ def scan_text(contents: str, location: str, denied: tuple[str, ...] = ()) -> lis
                 # A quoted placeholder followed by shell concatenation is a
                 # different value, not an allowed placeholder.
                 if rule not in {"secret-literal", "profile-literal"} or (
-                    match.end() == len(contents) or contents[match.end()] in " \t\r\n,]}):;#"
+                    match.end() == len(contents) or contents[match.end()] in " \t\r\n,]}):;#&|"
                 ):
                     continue
             findings.append(Finding(location, rule, contents.count("\n", 0, match.start()) + 1))
+    findings.extend(_structured_assignment_findings(contents, location))
     return findings
 
 
