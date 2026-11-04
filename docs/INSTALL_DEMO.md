@@ -175,6 +175,14 @@ URL's `/mcp`, sign in as an intended reader and discover `ask_analytics`.
 Call it with a JSON argument such as
 `{"question": "Compare completed orders by channel"}`.
 
+The certified-function expectations below use the demo's configured default
+`prefer_certified_functions: true` and an accepted classification with a matched
+approved function. If you set `prefer_certified_functions: false`, expect
+`route=genie` for those matched questions instead, even though the functions
+exist. Confidence and undefined-metric refusal gates still apply. With no
+approved function match, follow the normal Genie/refusal policy in the
+[customer smoke acceptance table](INSTALL_CUSTOMER.md#7-customer-smoke-checks).
+
 | Question / action | Expected result |
 | --- | --- |
 | Compare completed orders by channel | `route=genie`, `domain=retail`, `status=answered` |
@@ -185,7 +193,7 @@ Call it with a JSON argument such as
 | Show purchase conversion rate | `route=uc_function`, configured `conversion_rate` FQN, values between zero and one |
 | What is the engagement efficiency index? | `route=fail_loud`, `status=undefined_term` or `no_route` |
 | What is the weather forecast? | `route=fail_loud`, `status=no_route` |
-| Update the heading/body of `monthly_revenue.md` through reviewed Git changes, then wait at least 30 seconds and ask again | New `defs_commit_sha`, same approved function, no redeployment |
+| Update the heading/body of `monthly_revenue.md` through reviewed Git changes, then wait at least 30 seconds and ask again | New `defs_commit_sha`, unchanged configured policy and function allowlist, no redeployment |
 
 Verify trace IDs, route, configuration fingerprint, definitions revision and
 latency in both Delta and the configured MLflow experiment. Open the dashboard

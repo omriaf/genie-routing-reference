@@ -208,13 +208,20 @@ and require both to be ready before handoff.
 Connect an MCP client that supports Databricks Apps OAuth to the App URL's
 `/mcp` endpoint. Sign in as an intended App reader and discover `ask_analytics`.
 Call it with `{"question": "<APPROVED_TEST_QUESTION>"}`. Use non-sensitive test
-questions and record expected outcomes before testing:
+questions and record expected outcomes before testing. Smoke acceptance follows
+the configured `routing.prefer_certified_functions` policy, not the mere
+presence of functions in the allowlist. The policy rows below assume an
+approved function matched through a governed definition or classifier choice,
+the correct configured domain, sufficient confidence and no undefined metric.
+A matched definition never bypasses the classifier's confidence/refusal gates.
 
 | Check | Expected evidence |
 | --- | --- |
-| One known question per configured Genie domain without a certified alias | `status=answered`, `route=genie`, correct logical `domain` and existing Genie ID |
-| One exact governed alias per approved function | `route=uc_function`, correct configured function FQN and known result; skip only if the function list is empty |
-| A definition with `certified_function: null` | Genie answer enriched with the matched term and `enrichment_method=exact_alias` |
+| One known question per configured Genie domain with no matched or classifier-selected approved function | `status=answered`, `route=genie`, correct logical `domain` and existing Genie ID, subject to confidence/refusal gates |
+| `prefer_certified_functions: true` with a matched certified definition/function | `route=uc_function`, correct configured function FQN and known result; test an exact governed alias for each matched approved function |
+| `prefer_certified_functions: false` with a matched certified definition/function | `route=genie`, correct configured domain and Genie ID, even when approved functions exist; the certified function must not execute |
+| No approved function match (including an empty allowlist) | `route=genie` for a confidently classified configured domain; `route=fail_loud` for undefined metrics, insufficient confidence or no configured domain. Do not require function execution merely because functions exist. |
+| A definition with `certified_function: null` and no classifier-selected function | Genie answer enriched with the matched term and `enrichment_method=exact_alias`, subject to confidence/refusal gates |
 | An explicitly undefined metric and an unrelated question | `route=fail_loud`, `status=undefined_term` or `no_route`; no invented answer |
 | Inspect the resulting trace | Matching `trace_id`, `config_fingerprint`, `defs_commit_sha`, route and latency in Delta and the configured MLflow experiment |
 | Open the dashboard as a configured reader | Trace queries succeed with that reader's warehouse/data permissions |

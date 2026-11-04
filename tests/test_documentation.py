@@ -14,12 +14,38 @@ from pathlib import Path
 
 import pytest
 import yaml
+from conftest import model_decision
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = (
     "README.md", "AGENTS.md", "docs/INSTALL_DEMO.md", "docs/INSTALL_CUSTOMER.md",
     "docs/SECURITY.md", "docs/OPERATIONS.md", "docs/AI_ASSISTED_INSTALL.md",
 )
+
+
+def installation_documents():
+    pending = set(REQUIRED)
+    for file in ROOT.rglob("*.md"):
+        relative = file.relative_to(ROOT)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        if file.name in {"README.md", "AGENTS.md"} or relative.parts[0] == "docs":
+            pending.add(relative.as_posix())
+    discovered = set()
+    while pending:
+        relative = pending.pop()
+        if relative in discovered:
+            continue
+        discovered.add(relative)
+        if not (ROOT / relative).is_file():
+            continue  # The per-document check reports missing files as failures.
+        for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", read(relative)):
+            if "://" in target or target.startswith("#"):
+                continue
+            destination = (ROOT / relative).parent.joinpath(target.split("#")[0]).resolve()
+            if destination.suffix == ".md":
+                pending.add(destination.relative_to(ROOT).as_posix())
+    return tuple(sorted(discovered))
 
 
 def read(relative):
@@ -35,12 +61,111 @@ def commands(document):
                 yield shlex.split(line)
 
 
-@pytest.mark.parametrize("relative", REQUIRED)
+@pytest.mark.parametrize("relative", installation_documents())
 def test_installation_documents_exist_and_local_links_resolve(relative):
     document = read(relative)
     for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", document):
         if "://" not in target and not target.startswith("#"):
             assert (ROOT / relative).parent.joinpath(target.split("#")[0]).exists(), target
+
+
+def test_secondary_installation_documents_are_discovered():
+    assert {"demo/README.md", "demo/genie/README.md", "customer_config/README.md"} <= set(
+        installation_documents()
+    )
+
+
+def test_secondary_installation_broken_links_are_rejected(monkeypatch):
+    original_read = read
+
+    def broken_link(relative):
+        document = original_read(relative)
+        if relative == "demo/genie/README.md":
+            document += "\n[Broken handoff](missing-install-guide.md)\n"
+        return document
+
+    monkeypatch.setitem(globals(), "read", broken_link)
+    with pytest.raises(AssertionError, match="missing-install-guide.md"):
+        for relative in installation_documents():
+            test_installation_documents_exist_and_local_links_resolve(relative)
+
+
+@pytest.mark.parametrize("relative, option", [
+    ("demo/genie/README.md", "--include-serialized-space"),
+    ("docs/OPERATIONS.md", "--target customer"),
+])
+def test_secondary_or_repeated_cli_example_rejects_unknown_options(monkeypatch, relative, option):
+    if shutil.which("databricks") is None:
+        pytest.skip("CLI unavailable")
+    original_read = read
+
+    def invalid_option(filename):
+        document = original_read(filename)
+        if filename == relative:
+            document = document.replace(option, option + " --documentation-invalid-flag", 1)
+        return document
+
+    monkeypatch.setitem(globals(), "read", invalid_option)
+    with pytest.raises(AssertionError, match="--documentation-invalid-flag"):
+        test_documented_databricks_commands_match_installed_cli_help()
+
+
+@pytest.mark.parametrize("prefer, expected_route", [(True, "uc_function"), (False, "genie")])
+def test_customer_smoke_certified_match_obeys_documented_policy(
+    modules, runtime_document, install_runtime, workspace, prefer, expected_route,
+):
+    document = read("docs/INSTALL_CUSTOMER.md")
+    marker = f"`prefer_certified_functions: {str(prefer).lower()}`"
+    rows = [line for line in document.splitlines() if line.startswith("|") and marker in line]
+    assert len(rows) == 1, f"Missing smoke acceptance for {marker}"
+    assert "matched certified" in rows[0].casefold()
+    documented_route = re.search(r"route=(\w+)", rows[0])[1]
+    assert documented_route == expected_route
+
+    runtime_document["routing"]["prefer_certified_functions"] = prefer
+    runtime = install_runtime(runtime_document)
+    function = runtime.uc_functions[0]
+    workspace.decision = model_decision(domain=function.domain, candidates={function.domain: 0.9})
+    enrichment = modules.router.RoutingEnrichment(
+        domain=function.domain, certified_function=function.name, method="exact_alias", score=1.0,
+    )
+    result = modules.agent.ask_analytics("An approved metric", enrichment=enrichment)
+    assert result["route"] == documented_route
+    assert result["status"] == "answered"
+    if prefer:
+        assert result["uc_function"] == function.full_name
+    else:
+        assert result["genie_space_id"] == runtime.agents_by_name[function.domain].space_id
+        assert "uc_function" not in result
+        assert workspace.calls[-1][0] == "genie"
+
+
+@pytest.mark.parametrize("prefer", [True, False])
+@pytest.mark.parametrize("scenario, route, status", [
+    ("no_functions", "genie", "answered"), ("no_match", "genie", "answered"),
+    ("undefined_metric", "fail_loud", "undefined_term"),
+    ("low_confidence", "fail_loud", "no_route"),
+])
+def test_customer_smoke_without_function_match_preserves_genie_and_refusal_policy(
+    modules, runtime_document, install_runtime, workspace, prefer, scenario, route, status,
+):
+    document = read("docs/INSTALL_CUSTOMER.md")
+    rows = [line for line in document.splitlines() if line.startswith("| No approved function match")]
+    assert len(rows) == 1, "Missing no-function/no-match smoke acceptance"
+    assert {"genie", "fail_loud"} == set(re.findall(r"route=(\w+)", rows[0]))
+    runtime_document["routing"]["prefer_certified_functions"] = prefer
+    if scenario == "no_functions":
+        runtime_document["uc_functions"] = []
+    install_runtime(runtime_document)
+    workspace.decision = model_decision()
+    if scenario == "undefined_metric":
+        workspace.decision["undefined_terms"] = ["Unapproved metric"]
+    elif scenario == "low_confidence":
+        workspace.decision["confidence"] = 0.1
+    result = modules.agent.ask_analytics("A test question without a certified match")
+    assert (result["route"], result["status"]) == (route, status)
+    if route == "fail_loud":
+        assert len(workspace.calls) == 1  # Refused questions never execute a downstream route.
 
 
 def test_readme_explains_architecture_ownership_and_choice_before_installation():
@@ -209,8 +334,8 @@ def test_documented_databricks_commands_match_installed_cli_help():
     executable = shutil.which("databricks")
     if executable is None:
         pytest.skip("CLI not installed; no workspace or credentials required by this check")
-    seen = set()
-    for relative in REQUIRED:
+    help_text = {}
+    for relative in installation_documents():
         for cmd in commands(read(relative)):
             if cmd[0] != "databricks":
                 continue
@@ -220,12 +345,11 @@ def test_documented_databricks_commands_match_installed_cli_help():
                     break
                 command_path.append(word)
             key = tuple(command_path)
-            if key in seen:
-                continue
-            seen.add(key)
-            result = subprocess.run([executable, *command_path, "--help", "--profile", "<PROFILE>"],
-                                    cwd=ROOT, capture_output=True, text=True, timeout=15, check=False)
-            assert result.returncode == 0, (relative, key, result.stderr)
+            if key not in help_text:
+                result = subprocess.run([executable, *command_path, "--help", "--profile", "<PROFILE>"],
+                                        cwd=ROOT, capture_output=True, text=True, timeout=15, check=False)
+                assert result.returncode == 0, (relative, key, result.stderr)
+                help_text[key] = result.stdout
             # Catch unknown options even when help itself succeeds.
             for option in (arg for arg in cmd if arg.startswith("--")):
-                assert option in result.stdout, (relative, key, option)
+                assert option in help_text[key], (relative, key, option)
