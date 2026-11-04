@@ -2,8 +2,8 @@
 
 import importlib
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -104,3 +104,48 @@ class Workspace:
 @pytest.fixture
 def workspace():
     return Workspace()
+
+
+class TraceBackend:
+    """In-memory boundary for the external MLflow service, including failures."""
+
+    def __init__(self):
+        self.spans = []
+        self.experiment = None
+        self.failure = None
+        self.persisted = True
+
+    def check(self):
+        if self.failure:
+            raise RuntimeError(self.failure)
+
+    def set_tracking_uri(self, uri):
+        self.check()
+        self.uri = uri
+
+    def set_experiment(self, experiment):
+        self.check()
+        self.experiment = experiment
+
+    def start_span_no_context(self, **kwargs):
+        self.check()
+        entry = dict(kwargs)
+        self.spans.append(entry)
+
+        def end(*, outputs, end_time_ns):
+            self.check()
+            entry.update(outputs=outputs, end_time_ns=end_time_ns,
+                         execution_time_ms=(end_time_ns - entry["start_time_ns"]) // 1_000_000)
+
+        return SimpleNamespace(trace_id="mlflow-trace-123", end=end)
+
+    def get_trace(self, trace_id, *, silent=False, flush=False):
+        self.check()
+        return self.spans[-1] if self.persisted else None
+
+
+@pytest.fixture
+def trace_backend(monkeypatch):
+    backend = TraceBackend()
+    monkeypatch.setitem(sys.modules, "mlflow", backend)
+    return backend

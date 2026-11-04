@@ -1,0 +1,8 @@
+# The source tree must include the app and setup Python packages. Task 6's
+# deployment staging supplies runtime_config.json at the source root.
+command: [python, -m, app.app]
+env:
+  - name: ROUTER_CONFIG_PATH
+    value: runtime_config.json
+  - name: GITHUB_DEFINITIONS_TOKEN
+    valueFrom: definitions_secret

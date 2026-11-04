@@ -29,6 +29,7 @@ def ask_analytics(question: str, *, enrichment: router.RoutingEnrichment | None 
         result["genie_space_id"] = runtime.agents_by_name[decision.domain].space_id
         if decision.certified_function:
             active_route = "uc_function"
+            result["uc_function"] = runtime.functions_by_name[decision.certified_function].full_name
             function = uc_functions.execute_function(decision.certified_function, decision.function_arguments)
             text_rows = [" | ".join(function.columns)]
             text_rows.extend(" | ".join("" if item is None else str(item) for item in row) for row in function.rows[:10])
@@ -44,7 +45,7 @@ def ask_analytics(question: str, *, enrichment: router.RoutingEnrichment | None 
                           conversation_id=answer["conversation_id"], message_id=answer["message_id"])
     except Exception:
         # SDK exceptions can contain rejected inputs or credentials. Do not echo
-        # them to callers; Task 5 adds the durable tracing/health integration.
+        # them to callers; the MCP host records the sanitized result and health.
         result.update(status="error", route="error", failed_route=active_route,
                       answer="The configured analytics route failed.", error="Analytics service request failed")
     return result
