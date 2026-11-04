@@ -120,6 +120,13 @@ class GenieAgentConfig(StrictConfigModel):
     space_id: Annotated[str, StringConstraints(pattern=r"^[0-9a-fA-F]{32}$")]
     routing_guidance: NonBlank
 
+    @field_validator("name")
+    @classmethod
+    def reserve_refusal_marker(cls, value: str) -> str:
+        if value == "out_of_domain":
+            raise ValueError("Genie Agent name is reserved for routing refusal")
+        return value
+
 
 class UCFunctionConfig(StrictConfigModel):
     name: LogicalName

@@ -24,7 +24,7 @@ test = ["pytest>=8,<10"]
 Repository = "https://github.com/omriaf/genie-routing-reference"
 
 [tool.setuptools.packages.find]
-include = ["setup", "setup.*"]
+include = ["setup", "setup.*", "app", "app.*"]
 
 [tool.setuptools.package-data]
 setup = ["templates/*.j2"]

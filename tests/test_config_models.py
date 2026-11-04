@@ -81,6 +81,13 @@ def test_rejects_duplicate_agent_names(valid_config):
         RouterPackageConfig.model_validate(valid_config)
 
 
+def test_agent_name_cannot_shadow_the_runtime_refusal_marker(valid_config):
+    valid_config["genie_agents"][0]["name"] = "out_of_domain"
+    valid_config["uc_functions"][0]["domain"] = "out_of_domain"
+    with pytest.raises(ValidationError):
+        RouterPackageConfig.model_validate(valid_config)
+
+
 def test_rejects_function_with_unknown_domain(valid_config):
     valid_config["uc_functions"][0]["domain"] = "unknown"
     with pytest.raises(ValidationError, match="[Uu]nknown.*domain"):
