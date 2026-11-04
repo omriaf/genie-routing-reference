@@ -37,11 +37,120 @@ def test_prompt_schema_and_space_mapping_are_entirely_dynamic(
         schema = classifier[0][2]["response_format"]["json_schema"]["schema"]
         assert "Synthetic Organization" in prompt
         assert schema["properties"]["domain"]["enum"] == [f"area_{i}" for i in range(count)] + ["out_of_domain"]
-        assert set(schema["properties"]["candidates"]["properties"]) == {f"area_{i}" for i in range(count)}
+        candidate_schema = schema["properties"]["candidates"]
+        assert set(candidate_schema["propertyNames"]["enum"]) == {f"area_{i}" for i in range(count)}
+        assert candidate_schema["maxProperties"] == 5
+        assert not candidate_schema.get("required")
         for i in range(count):
             assert f"Unique subject {i}" in prompt
             assert f"Use this for synthetic topic {i}" in prompt
         assert "sales" not in prompt and "support" not in prompt
+
+
+@pytest.fixture
+def many_domains(runtime_document):
+    runtime_document["uc_functions"] = []
+    runtime_document["genie_agents"] = [
+        {
+            "name": f"area_{index:03d}".ljust(63, "x"),
+            "description": f"Distinct subject {index}",
+            "routing_guidance": f"Route topic {index} here",
+            "space_id": f"{index + 20:032x}",
+        }
+        for index in range(80)
+    ]
+    return runtime_document
+
+
+@pytest.mark.parametrize("selected_index", [0, 40, 79])
+@pytest.mark.parametrize("candidate_count", [1, 5])
+def test_many_domains_keep_all_routes_and_bound_candidate_output(
+    modules, many_domains, install_runtime, workspace, selected_index, candidate_count,
+):
+    install_runtime(many_domains)
+    selected = many_domains["genie_agents"][selected_index]
+    alternatives = [
+        agent["name"] for agent in many_domains["genie_agents"]
+        if agent["name"] != selected["name"]
+    ][:candidate_count - 1]
+    candidates = {selected["name"]: 0.9, **dict.fromkeys(alternatives, 0.1)}
+    workspace.decision = model_decision(selected["name"], candidates=candidates)
+
+    answer = modules.agent.ask_analytics("Describe this topic")
+
+    assert answer["status"] == "answered"
+    assert answer["domain"] == selected["name"]
+    assert answer["genie_space_id"] == selected["space_id"]
+    assert answer["candidates"] == candidates
+    assert len(workspace.calls) == 2
+    request = workspace.calls[0][2]
+    prompt = request["messages"][0]["content"]
+    schema = request["response_format"]["json_schema"]["schema"]
+    all_names = [agent["name"] for agent in many_domains["genie_agents"]]
+    assert schema["properties"]["domain"]["enum"] == all_names + ["out_of_domain"]
+    assert {"domain", "confidence", "candidates"} <= set(schema["required"])
+    candidate_schema = schema["properties"]["candidates"]
+    assert candidate_schema["maxProperties"] == 5
+    assert candidate_schema["propertyNames"]["enum"] == all_names
+    assert not candidate_schema.get("required")
+    assert "at most 5" in prompt
+    assert "selected domain" in prompt
+    for agent in many_domains["genie_agents"]:
+        assert agent["name"] in prompt
+        assert agent["description"] in prompt
+        assert agent["routing_guidance"] in prompt
+
+
+@pytest.mark.parametrize("invalid", ["too_many", "unknown", "missing_selected", "empty"])
+def test_sparse_candidates_fail_closed_for_invalid_sets(
+    modules, many_domains, install_runtime, workspace, invalid,
+):
+    install_runtime(many_domains)
+    agents = many_domains["genie_agents"]
+    candidates = {agent["name"]: 0.9 for agent in agents[:5]}
+    if invalid == "too_many":
+        candidates[agents[5]["name"]] = 0.1
+    elif invalid == "unknown":
+        candidates = {agents[0]["name"]: 0.9, "unconfigured": 0.1}
+    elif invalid == "missing_selected":
+        candidates = {agents[1]["name"]: 0.9}
+    else:
+        candidates = {}
+    workspace.decision = model_decision(agents[0]["name"], candidates=candidates)
+
+    answer = modules.agent.ask_analytics("Describe this topic")
+
+    assert answer["status"] == "no_route"
+    assert answer["route"] == "fail_loud"
+    assert len(workspace.calls) == 1
+
+
+def test_compact_five_candidate_contract_fits_fixed_output_budget(
+    modules, many_domains, install_runtime, workspace,
+):
+    install_runtime(many_domains)
+    selected = many_domains["genie_agents"][-1]["name"]
+    candidates = {
+        agent["name"]: 0.12345678901234568
+        for agent in many_domains["genie_agents"][:4]
+    }
+    candidates[selected] = 0.9876543210987654
+    workspace.decision = model_decision(
+        selected, candidates=candidates, confidence=0.9876543210987654,
+        reasoning="This configured subject is the closest match to the analytics question.",
+    )
+
+    decision = modules.router.classify("Describe this topic")
+
+    assert decision.accepted is True
+    assert len(workspace.calls) == 1
+    request = workspace.calls[0][2]
+    assert request["max_tokens"] == modules.router.CLASSIFIER_MAX_TOKENS
+    # A conservative, tokenizer-independent size check for the compact routing
+    # envelope: five maximum-length identifiers, full-precision scores, and all
+    # required fields. Arbitrary optional prose/argument values are not covered.
+    compact_output = json.dumps(workspace.decision, separators=(",", ":"))
+    assert len(compact_output.encode("utf-8")) <= request["max_tokens"]
 
 
 def test_function_prompt_uses_logical_names_and_configured_metadata(
@@ -65,7 +174,7 @@ def test_function_prompt_uses_logical_names_and_configured_metadata(
     {"confidence": float("nan")}, {"confidence": float("inf")},
     {"confidence": -0.1}, {"confidence": 1.1},
     {"candidates": {"sales": 0.9, "invented": 0.8}},
-    {"candidates": {"sales": 0.9}},
+    {"candidates": {"support": 0.9}},
     {"candidates": {"sales": 0.9, "support": float("nan")}},
     {"certified_function": "resolution_time"},
     {"certified_function": "unknown"},
