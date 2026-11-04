@@ -9,7 +9,7 @@ dbutils.widgets.text("schema", "")
 dbutils.widgets.text("generators_dir", "")
 sys.path.insert(0, dbutils.widgets.get("generators_dir"))
 
-from generate import seed_sql
+from generate import seed_sql  # noqa: E402 - the notebook supplies its import path above.
 
 for statement in seed_sql(dbutils.widgets.get("catalog"), dbutils.widgets.get("schema")).split(";"):
     if statement.strip():

@@ -80,3 +80,8 @@ python -m pytest -q
 Offline tests exercise configuration, routing and generated resource contracts.
 Authenticated preflight, strict workspace validation and live smoke checks are
 also required before calling an installation ready.
+
+The [verification guide](validation/README.md) includes the local publication
+scanner, synthetic production/demo compilation, explicit-profile smoke tooling
+and a local clean-clone rehearsal. Keep internal results and test settings in
+its ignored paths.

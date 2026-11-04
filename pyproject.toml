@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "jsonschema>=4,<5"]
+test = ["pytest>=8,<10", "jsonschema>=4,<5", "ruff>=0.17,<1"]
 
 [project.urls]
 Repository = "https://github.com/omriaf/genie-routing-reference"
@@ -34,3 +34,9 @@ app = ["app.yaml", "requirements.txt"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
