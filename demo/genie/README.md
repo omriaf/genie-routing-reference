@@ -1,15 +1,12 @@
 # Import the three sample Genie Agents
 
-Use the environment variables and generated output from
-[the demo setup](../README.md). Complete the `seed.sql` run first: the tables
-must exist and be readable when Genie imports the definitions. Use Databricks
-CLI 1.0+ with an explicitly selected authenticated profile, and install `jq` to
-inspect the responses below. The installer needs permission to create items
-under the selected workspace folder and to delegate `CAN_RUN` on the created
-agents to the router App principal. Genie also requires an enabled Genie
-experience and a supported Pro or Serverless SQL warehouse.
+Use the exact command sequence and approval gates in the canonical
+[demo installation guide](../../docs/INSTALL_DEMO.md). Seed the configured
+source tables first, then import each domain once and insert its returned
+space ID into the matching entry in `.generated-demo-setup/demo.yml`.
+The compiler and DAB do not create Genie Agents or discover IDs.
 
-The offline preparation command generates three complete create requests:
+## Generated import requests
 
 | Request file | Domain | Data source |
 | --- | --- | --- |
@@ -19,56 +16,30 @@ The offline preparation command generates three complete create requests:
 
 Each contains `warehouse_id`, `title`, `description`, `parent_path`, and
 `serialized_space`. The last field is a **JSON string**, containing a version-2
-definition with fully qualified tables, sample questions, text instructions,
+definition with fully qualified tables, sample questions, text instructions
 and example SQL. It is encoded once inside the outer request. Internal
-32-character IDs are deterministic sample question/instruction identifiers;
-they are unrelated to workspace Genie IDs. No live workspace ID is supplied by
-the package.
+32-character IDs are deterministic content identifiers, unrelated to workspace
+Genie IDs. No live workspace ID is supplied by the package.
 
-Inspect the JSON before importing; for example:
+Inspect all three decoded definitions before importing. Confirm the selected
+warehouse, source tables, workspace folder and permissions in the Genie UI,
+then run each included sample question. The execution identity needs warehouse
+use, UC traversal and source-table read access. The installer must be able to
+delegate `CAN_RUN` to the App through recorded management authority.
 
-```bash
-jq '.serialized_space | fromjson' "$DEMO_OUTPUT/retail.create.json"
-databricks workspace mkdirs "$DEMO_PARENT_PATH" --profile "$DEMO_PROFILE"
+## Inspect an existing definition
 
-databricks genie create-space --json @"$DEMO_OUTPUT/retail.create.json" \
-  --profile "$DEMO_PROFILE" --output json > "$DEMO_OUTPUT/retail.created.json"
-databricks genie create-space --json @"$DEMO_OUTPUT/support.create.json" \
-  --profile "$DEMO_PROFILE" --output json > "$DEMO_OUTPUT/support.created.json"
-databricks genie create-space --json @"$DEMO_OUTPUT/marketing.create.json" \
-  --profile "$DEMO_PROFILE" --output json > "$DEMO_OUTPUT/marketing.created.json"
-
-jq -r '.space_id' "$DEMO_OUTPUT/retail.created.json"
-jq -r '.space_id' "$DEMO_OUTPUT/support.created.json"
-jq -r '.space_id' "$DEMO_OUTPUT/marketing.created.json"
-```
-
-Check every command succeeded and each ID is a 32-character hexadecimal value.
-Edit `$DEMO_OUTPUT/demo.yml`: replace `REPLACE_RETAIL_SPACE_ID`,
-`REPLACE_SUPPORT_SPACE_ID`, and `REPLACE_MARKETING_SPACE_ID` with the respective
-returned IDs, keeping them quoted as YAML strings. This is the installer-edited
-copy rendered from `demo/config/demo.yml`. No compiler or bundle operation
-creates these agents or discovers their IDs. Re-running `create-space` creates
-additional agents, so keep the returned IDs for reuse.
-
-Verify each imported agent in the workspace Genie UI and run its included
-sample question. Confirm the selected warehouse, source table, and permissions.
-Then continue with `--demo` compilation and preflight in the demo README.
-
-To reuse an existing sample agent, export its definition for inspection with
-the selected profile (substitute one of your returned IDs):
+Substitute a returned ID and the profile explicitly chosen by the human:
 
 ```bash
-DEMO_SPACE_ID='<returned-agent-id>'
-databricks genie get-space "$DEMO_SPACE_ID" --include-serialized-space \
-  --profile "$DEMO_PROFILE" --output json \
-  | jq '.serialized_space | fromjson' > "$DEMO_OUTPUT/exported-agent.json"
+databricks genie get-space "<GENIE_SPACE_ID>" --include-serialized-space --profile "<PROFILE>" --output json > .generated-demo-setup/exported-agent.json
+jq '.serialized_space | fromjson' .generated-demo-setup/exported-agent.json
 ```
 
-When migrating to another catalog/schema or warehouse, rerun offline preparation
-with the new settings and import those newly generated `*.create.json` requests
-into the destination workspace using its explicitly chosen profile. Preserve
-the destination IDs in that destination's rendered config. Catalog/schema
-references occur in both table identifiers and SQL; regenerating the requests
-updates both. Agents and their permissions remain installer-owned external
-dependencies throughout this flow.
+Keep exports private. When migrating to another catalog/schema or warehouse,
+regenerate the import requests with destination values; this updates both
+source-table identifiers and example SQL. Obtain setup approval, import into
+the destination using its human-selected profile, and retain destination IDs
+in that destination's rendered config. Re-running successful create commands
+creates duplicate external agents. See [Operations](../../docs/OPERATIONS.md)
+for separate cleanup of agents and sample SQL objects.

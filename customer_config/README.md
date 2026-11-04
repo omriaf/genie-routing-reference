@@ -122,8 +122,8 @@ owned by the package's deployment resources, rather than editable YAML fields.
 
 ## Profiles, targets, and generated output
 
-Pass the deployment target and `--profile <name>` explicitly at command time
-when using future deployment commands. Profiles, hosts, and credentials are
+Pass `--target customer` and `--profile "<PROFILE>"` explicitly at command time
+when using deployment commands. Profiles, hosts, and credentials are
 not configuration fields, and the package never auto-selects a profile.
 Do not modify application, setup, or resource code for customer settings.
 Generated artifacts belong under the ignored `.generated/` directory.
