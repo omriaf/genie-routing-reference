@@ -44,7 +44,7 @@ resources:
           permission: MODIFY
           securable_full_name: acme_catalog.analytics_router.routing_traces
           securable_type: TABLE
-      source_code_path: ../app
+      source_code_path: app_source
   dashboards:
     router_dashboard:
       permissions:

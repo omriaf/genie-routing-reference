@@ -2,23 +2,28 @@
 
 import argparse
 import ctypes
-from dataclasses import dataclass
 import errno
 import json
 import os
-from pathlib import Path
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateError
 import yaml
+from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateError
 
 from setup.models import RouterPackageConfig, _UniqueKeySafeLoader, load_customer_config
 
-
 _TEMPLATE_DIR = Path(__file__).with_name("templates")
 _DEMO_RESOURCE_DIR = Path(__file__).resolve().parents[1] / "demo/resources"
-_FILENAMES = ("customer.resources.yml", "runtime_config.json", "summary.json")
+_APP_SOURCE_DIR = Path(__file__).resolve().parents[1] / "app"
+_APP_MODULES = (
+    "__init__.py", "agent.py", "app.py", "config.py", "definitions.py",
+    "genie_client.py", "markdown_definitions.py", "router.py",
+    "runtime_config.py", "tracing.py", "uc_functions.py",
+)
+_FILENAMES = ("customer.resources.yml", "runtime_config.json", "summary.json", "app_source")
 
 
 @dataclass(frozen=True)
@@ -26,10 +31,11 @@ class CompileResult:
     runtime_config: Path
     resources: Path
     summary: Path
+    app_source: Path
 
     @property
     def generated_paths(self) -> tuple[Path, ...]:
-        return (self.resources, self.runtime_config, self.summary)
+        return (self.resources, self.runtime_config, self.summary, self.app_source)
 
 
 def _json_text(value: dict) -> str:
@@ -56,13 +62,13 @@ def _validate_resource_document(document: object) -> dict:
         raise ValueError("A resource document must contain only a resources mapping")
     resources = document["resources"]
     if not isinstance(resources, dict):
-        raise ValueError("Resource groups must be mappings")
+        raise ValueError("Resource groups must be mappings")  # noqa: TRY004 - compiler validation contract
     for kind, declarations in resources.items():
         if not isinstance(kind, str) or not isinstance(declarations, dict):
-            raise ValueError("Resource groups must be named mappings")
+            raise ValueError("Resource groups must be named mappings")  # noqa: TRY004 - compiler validation contract
         for name, body in declarations.items():
             if not isinstance(name, str) or not isinstance(body, dict):
-                raise ValueError("Resource declarations must be named mappings")
+                raise ValueError("Resource declarations must be named mappings")  # noqa: TRY004 - compiler validation contract
 
     def reject_include(value):
         if isinstance(value, dict):
@@ -189,7 +195,7 @@ def _resource_document(runtime: dict, demo_resources: dict) -> dict:
     )
     app = {
         "name": runtime["customer"]["app_name"],
-        "source_code_path": "../app",
+        "source_code_path": "app_source",
         "resources": sorted(bindings, key=lambda binding: binding["name"]),
     }
     if runtime["permissions"]["app"]:
@@ -237,7 +243,33 @@ def _resource_summary(runtime: dict, demo: bool, demo_resources: dict) -> dict:
     return summary
 
 
-def _validate_artifacts(staging: Path, runtime: dict, resources: dict, summary: dict) -> None:
+def _stage_app(staging: Path) -> dict[str, bytes]:
+    """Copy only the deployed runtime, never an entire checkout or source folder."""
+    sources = {f"app/{name}": _APP_SOURCE_DIR / name for name in _APP_MODULES}
+    sources.update({
+        "setup/__init__.py": Path(__file__).with_name("__init__.py"),
+        "setup/models.py": Path(__file__).with_name("models.py"),
+        "app.yaml": _APP_SOURCE_DIR / "app.yaml",
+        "requirements.txt": _APP_SOURCE_DIR / "requirements.txt",
+    })
+    if _APP_SOURCE_DIR.is_symlink():
+        raise ValueError("App source must not be a symlink")
+    payload = {}
+    for name, source in sorted(sources.items()):
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("Required App source is missing or is a symlink")
+        payload[name] = source.read_bytes()
+    payload["runtime_config.json"] = (staging / "runtime_config.json").read_bytes()
+    for name, data in sorted(payload.items()):
+        destination = staging / "app_source" / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+    return payload
+
+
+def _validate_artifacts(
+    staging: Path, runtime: dict, resources: dict, summary: dict, app_files: dict[str, bytes],
+) -> None:
     try:
         loaded_runtime = json.loads((staging / "runtime_config.json").read_text(encoding="utf-8"))
         RouterPackageConfig.model_validate(loaded_runtime)
@@ -249,6 +281,25 @@ def _validate_artifacts(staging: Path, runtime: dict, resources: dict, summary: 
         loaded_summary = json.loads((staging / "summary.json").read_text(encoding="utf-8"))
         if (loaded_runtime, loaded_resources, loaded_summary) != (runtime, resources, summary):
             raise ValueError("Rendered artifacts differ from the validated configuration")
+        source = staging / "app_source"
+        paths = list(source.rglob("*"))
+        if any(path.is_symlink() for path in paths):
+            raise ValueError("Generated App source contains a symlink")
+        staged_files = {path.relative_to(source).as_posix(): path.read_bytes()
+                        for path in paths if path.is_file()}
+        if staged_files != app_files:
+            raise ValueError("Generated App source differs from the staged runtime")
+        manifest = yaml.load(staged_files["app.yaml"], Loader=_UniqueKeySafeLoader)
+        if not isinstance(manifest, dict) or manifest.get("command") != ["python", "-m", "app.app"]:
+            raise ValueError("Generated App manifest has an invalid command")
+        settings = manifest.get("env")
+        if not isinstance(settings, list) or [
+            setting for setting in settings
+            if isinstance(setting, dict) and setting.get("name") == "ROUTER_CONFIG_PATH"
+        ] != [{"name": "ROUTER_CONFIG_PATH", "value": "runtime_config.json"}]:
+            raise ValueError("Generated App manifest has an invalid runtime path")
+        if staged_files["runtime_config.json"] != (staging / "runtime_config.json").read_bytes():
+            raise ValueError("Generated App configuration differs from compiler output")
     except (ValueError, yaml.YAMLError, UnicodeError):
         raise ValueError("Generated artifacts failed validation") from None
 
@@ -316,7 +367,8 @@ def compile_config(config_path: Path, output_dir: Path, demo: bool) -> CompileRe
         except TemplateError:
             raise ValueError("Configuration template rendering failed") from None
         (staging / "summary.json").write_text(_json_text(summary), encoding="utf-8")
-        _validate_artifacts(staging, runtime, resources, summary)
+        app_files = _stage_app(staging)
+        _validate_artifacts(staging, runtime, resources, summary, app_files)
         # Recheck immediately before publication as well as before staging.
         _output_destination(config_path, output)
         if output.exists():
@@ -328,6 +380,7 @@ def compile_config(config_path: Path, output_dir: Path, demo: bool) -> CompileRe
         runtime_config=output / "runtime_config.json",
         resources=output / "customer.resources.yml",
         summary=output / "summary.json",
+        app_source=output / "app_source",
     )
 
 

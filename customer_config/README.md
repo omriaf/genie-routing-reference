@@ -134,6 +134,13 @@ Compile with `python -m setup.compile_config --config customer_config/customer.y
 `include` section; generated and static resource files contain a `resources`
 mapping instead.
 
+The compiler also stages the deployable App at `.generated/app_source/` and
+points the generated App resource there. It includes the runtime packages,
+root `app.yaml`, `requirements.txt`, and the validated `runtime_config.json`.
+Customer YAML, tests, Git metadata, and unrelated source files are excluded.
+Configuration and App source are validated and published together in one
+atomic directory replacement; a failed compile preserves the previous output.
+
 Demo mode is opt-in with `--demo`. It reads packaged definitions from
 `demo/resources/*.yml` and `*.yaml`, validates their resource-only shape, and
 merges them directly into the same generated document. Demo files cannot

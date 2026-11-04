@@ -1,6 +1,8 @@
 """Trace contents, durable-write checks, redaction, and MLflow boundaries."""
 
 import json
+import logging
+from threading import get_ident
 
 import pytest
 
@@ -221,3 +223,111 @@ def test_real_mlflow_persists_the_request_and_complete_provenance(
     assert span.attributes["routing.config_fingerprint"] == "f" * 64
     assert span.attributes["routing.latency_ms"] == 123
     assert (span.end_time_ns - span.start_time_ns) // 1_000_000 == 123
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("http_status", [401, 500])
+def test_real_exporter_failure_redacts_backend_messages_before_logging(
+    modules, runtime_document, install_runtime, tmp_path, monkeypatch, caplog, capsys, asynchronous, http_status,
+):
+    monkeypatch.setenv("MLFLOW_DISABLE_AGENT_HINT", "1")
+    monkeypatch.setenv("MLFLOW_ENABLE_ASYNC_TRACE_LOGGING", str(asynchronous).lower())
+    import mlflow
+    from mlflow.exceptions import MlflowException, get_error_code
+    from mlflow.tracing.client import TracingClient
+
+    factory = logging.getLogRecordFactory()
+    tracking_uri = mlflow.get_tracking_uri()
+    set_tracking_uri = mlflow.set_tracking_uri
+    mlflow.tracing.reset()
+    local_uri = "sqlite:///" + str(tmp_path / "exporter-failure.db")
+    monkeypatch.setattr(mlflow, "set_tracking_uri", lambda _: set_tracking_uri(local_uri))
+    runtime = install_runtime(runtime_document)
+    recorder = modules.tracing.TraceRecorder(runtime)
+    recorder.initialize()
+    attempts = []
+    sentinel = "SENTINEL_EXPORTER_CREDENTIAL_DO_NOT_LOG"
+
+    def rejected_backend(*args, **kwargs):
+        attempts.append(get_ident())
+        raise MlflowException("Authorization: Bearer " + sentinel, error_code=get_error_code(http_status))
+
+    # Keep the real span processor, exporter wrappers, async queue, and read-back.
+    # Only the backend client's writes fail, exactly where exporter diagnostics originate.
+    monkeypatch.setattr(TracingClient, "start_trace", rejected_backend)
+    monkeypatch.setattr(TracingClient, "log_spans", rejected_backend)
+    caplog.set_level(logging.DEBUG, logger="mlflow.tracing.export.mlflow_v3")
+    caplog.set_level(logging.DEBUG, logger="mlflow.tracing.fluent")
+    exporter_logger = logging.getLogger("mlflow.tracing.export.mlflow_v3")
+    exporter_logger.addHandler(caplog.handler)  # MLflow may disable propagation to root handlers.
+    caplog.clear()
+    try:
+        record = recorder.record(result(), enrichment(modules), 123)
+        mlflow.flush_trace_async_logging()
+        assert attempts, "The real exporter did not reach the failing backend"
+        if asynchronous:
+            assert any(thread != get_ident() for thread in attempts)
+        assert record["mlflow_trace_ok"] is False
+        assert recorder.health()["mlflow"]["status"] == "degraded"
+        assert recorder.health()["delta"]["status"] == "ready"
+        logs = caplog.text + capsys.readouterr().err
+        assert sentinel not in logs
+        assert "mlflow tracing failed" in logs
+        assert "MLflow tracing diagnostic redacted" in logs
+        assert any(entry.name.startswith("mlflow.tracing.export") and entry.levelno == (
+            logging.ERROR if http_status == 401 else logging.WARNING
+        ) for entry in caplog.records)
+        assert all(entry.exc_info is None and entry.exc_text is None
+                   for entry in caplog.records if entry.name.startswith("mlflow."))
+    finally:
+        mlflow.tracing.reset()
+        exporter_logger.removeHandler(caplog.handler)
+        set_tracking_uri(tracking_uri)
+        logging.setLogRecordFactory(factory)
+
+
+def test_logging_boundary_covers_future_worker_loggers_and_preserves_app_context(
+    recorder, caplog,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    previous = logging.getLogRecordFactory()
+    captured = []
+
+    def contextual_record(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        record.request_context = "preserved"
+        return record
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            captured.append(record)
+
+    vendor = logging.getLogger("opentelemetry.future.export.worker")
+    handler = Capture()
+    vendor.addHandler(handler)
+    try:
+        logging.setLogRecordFactory(contextual_record)
+        recorder.initialize()
+
+        def log_in_worker():
+            try:
+                raise RuntimeError("FUTURE_WORKER_SECRET")
+            except RuntimeError:
+                vendor.error("backend %s", "FUTURE_WORKER_SECRET", exc_info=True, stack_info=True)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(log_in_worker).result(timeout=2)
+        assert captured
+        assert captured[0].getMessage() == "MLflow tracing diagnostic redacted"
+        assert captured[0].request_context == "preserved"
+        assert captured[0].exc_info is None
+        assert captured[0].exc_text is None
+        assert captured[0].stack_info is None
+        assert captured[0].args == ()
+        logging.getLogger("analytics.request").error("Application diagnostic remains useful")
+        assert "Application diagnostic remains useful" in caplog.text
+        assert "FUTURE_WORKER_SECRET" not in caplog.text
+    finally:
+        vendor.removeHandler(handler)
+        logging.setLogRecordFactory(previous)

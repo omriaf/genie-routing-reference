@@ -1,5 +1,5 @@
-# The source tree must include the app and setup Python packages. Task 6's
-# deployment staging supplies runtime_config.json at the source root.
+# The compiler stages this manifest, both required Python packages, requirements,
+# and runtime_config.json together at .generated/app_source/.
 command: [python, -m, app.app]
 env:
   - name: ROUTER_CONFIG_PATH

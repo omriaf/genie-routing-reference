@@ -4,16 +4,15 @@ import copy
 import importlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
 
 from setup.models import load_customer_config
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOTS = Path(__file__).with_name("snapshots")
@@ -63,7 +62,8 @@ def write_config(directory, data):
 
 
 def files(directory):
-    return {path.name: path.read_bytes() for path in sorted(directory.iterdir())}
+    return {path.relative_to(directory).as_posix(): path.read_bytes()
+            for path in sorted(directory.rglob("*")) if path.is_file()}
 
 
 def compile_documents(compiler, tmp_path, customer, demo=False):
@@ -84,7 +84,7 @@ def test_compiled_artifacts_match_reviewed_snapshots(compiler, tmp_path, custome
     assert result.runtime_config.read_bytes() == (SNAPSHOTS / "compiled_runtime.json").read_bytes()
     assert result.resources.read_bytes() == (SNAPSHOTS / "compiled_resources.yml").read_bytes()
     assert [path.name for path in result.generated_paths] == [
-        "customer.resources.yml", "runtime_config.json", "summary.json"
+        "customer.resources.yml", "runtime_config.json", "summary.json", "app_source"
     ]
     assert result.summary.name == "summary.json"
     assert runtime["routing"]["confidence_threshold"] == 0.75
@@ -92,6 +92,139 @@ def test_compiled_artifacts_match_reviewed_snapshots(compiler, tmp_path, custome
     assert load_customer_config(result.runtime_config) == load_customer_config(
         tmp_path / "customer.yml"
     )
+
+
+def test_generated_source_is_complete_minimal_and_relative_to_its_resource(compiler, tmp_path, customer):
+    result, _, document, _ = compile_documents(compiler, tmp_path, customer)
+    source = (result.resources.parent / document["resources"]["apps"]["router_app"]["source_code_path"]).resolve()
+    assert source.is_relative_to(result.resources.parent)
+    assert source.is_dir()
+    assert result.app_source == source
+    assert sorted(files(source)) == json.loads((SNAPSHOTS / "compiled_app_files.json").read_text())
+    manifest = yaml.safe_load((source / "app.yaml").read_text())
+    runtime_path = next(item["value"] for item in manifest["env"] if item["name"] == "ROUTER_CONFIG_PATH")
+    assert (source / runtime_path).read_bytes() == result.runtime_config.read_bytes()
+    assert load_customer_config(source / runtime_path) == load_customer_config(tmp_path / "customer.yml")
+
+
+def test_staging_uses_an_allowlist_and_never_copies_private_or_unrelated_files(
+    compiler, tmp_path, customer, monkeypatch,
+):
+    source = tmp_path / "package/app"
+    shutil.copytree(ROOT / "app", source, ignore=shutil.ignore_patterns("__pycache__"))
+    for name in ("customer.yml", ".env", "private.py", "tests/test_private.py", ".git/config", "docs/internal.md"):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("SOURCE_SECRET_MUST_NOT_BE_STAGED")
+    monkeypatch.setattr(compiler, "_APP_SOURCE_DIR", source, raising=False)
+    result, _, document, _ = compile_documents(compiler, tmp_path, customer)
+    staged = result.resources.parent / document["resources"]["apps"]["router_app"]["source_code_path"]
+    assert staged.is_dir()
+    assert sorted(files(staged)) == json.loads((SNAPSHOTS / "compiled_app_files.json").read_text())
+    assert all(b"SOURCE_SECRET_MUST_NOT_BE_STAGED" not in content for content in files(staged).values())
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("problem", ["missing_module", "symlink_module", "write_failure", "corrupt_runtime", "bad_manifest"])
+def test_app_staging_failure_preserves_the_complete_generation(
+    compiler, tmp_path, customer, monkeypatch, existing, problem,
+):
+    config = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    if existing:
+        compiler.compile_config(config, output, False)
+    before = files(output) if existing else None
+    source = tmp_path / "package/app"
+    shutil.copytree(ROOT / "app", source, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(compiler, "_APP_SOURCE_DIR", source, raising=False)
+    if problem in {"missing_module", "symlink_module"}:
+        (source / "router.py").unlink()
+        if problem == "symlink_module":
+            private = tmp_path / "private"
+            private.write_text("SOURCE_SECRET_MUST_NOT_BE_STAGED")
+            (source / "router.py").symlink_to(private)
+    elif problem == "bad_manifest":
+        manifest = yaml.safe_load((source / "app.yaml").read_text())
+        manifest["env"][0]["value"] = "missing-runtime.json"
+        (source / "app.yaml").write_text(yaml.safe_dump(manifest))
+    else:
+        write_bytes = Path.write_bytes
+
+        def broken_stage(path, data):
+            if path.parent.name == "app_source" and path.name == "runtime_config.json":
+                if problem == "write_failure":
+                    raise OSError("Simulated staged App write failure")
+                data = b"{}"
+            return write_bytes(path, data)
+
+        monkeypatch.setattr(Path, "write_bytes", broken_stage)
+    with pytest.raises((ValueError, OSError)):
+        compiler.compile_config(config, output, False)
+    assert (files(output) if output.exists() else None) == before
+    assert not list(tmp_path.glob(".generated-*"))
+
+
+def test_staged_manifest_launches_with_its_own_packages_and_runtime(compiler, tmp_path, customer):
+    result, _, document, _ = compile_documents(compiler, tmp_path, customer)
+    source = result.resources.parent / document["resources"]["apps"]["router_app"]["source_code_path"]
+    assert source.is_dir()
+    # Isolated Python excludes the checkout and PYTHONPATH. Only the generated
+    # source root is added; network and server binding are the external doubles.
+    script = '''
+import base64
+import json
+import os
+from pathlib import Path
+import runpy
+import sys
+from types import SimpleNamespace
+sys.path.insert(0, str(Path.cwd()))
+import yaml
+import uvicorn
+from fastapi.testclient import TestClient
+from app import definitions
+from app.runtime_config import get_runtime_config
+from setup import models
+assert Path(definitions.__file__).is_relative_to(Path.cwd())
+assert Path(models.__file__).is_relative_to(Path.cwd())
+manifest = yaml.safe_load(Path('app.yaml').read_text())
+for setting in manifest['env']:
+    if 'value' in setting:
+        os.environ[setting['name']] = setting['value']
+os.environ['GITHUB_DEFINITIONS_TOKEN'] = 'synthetic-bound-token'
+os.environ['DATABRICKS_APP_PORT'] = '8123'
+runtime = get_runtime_config()
+assert runtime.customer.app_name == 'acme-analytics-router'
+text = '---\\nname: monthly_revenue\\ndomain: sales\\naliases: []\\ncertified_function: monthly_revenue\\n---\\nMonthly revenue.\\n'
+class GitHub:
+    def get(self, url, **kwargs):
+        if '/commits/' in url:
+            body = {'sha': 'a' * 40}
+        elif '/contents/definitions?' in url:
+            body = [{'name': 'revenue.md', 'path': 'definitions/revenue.md', 'type': 'file'}]
+        else:
+            body = {'type': 'file', 'path': 'definitions/revenue.md', 'size': len(text.encode()),
+                    'encoding': 'base64', 'content': base64.b64encode(text.encode()).decode()}
+        return definitions.GitHubResponse(200, json.dumps(body).encode(), {})
+definitions.GitHubTransport = GitHub
+sys.modules['mlflow'] = SimpleNamespace(set_tracking_uri=lambda _: None, set_experiment=lambda _: None)
+def serve(app, *, host, port):
+    assert (host, port) == ('0.0.0.0', 8123)
+    with TestClient(app) as client:
+        assert client.get('/health').json()['ready'] is True
+        response = client.post('/mcp', headers={'Accept': 'application/json, text/event-stream'},
+            json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}, follow_redirects=False)
+        assert response.status_code == 200
+        assert [tool['name'] for tool in response.json()['result']['tools']] == ['ask_analytics']
+uvicorn.run = serve
+assert manifest['command'][:2] == ['python', '-m']
+runpy.run_module(manifest['command'][2], run_name='__main__')
+print('staged manifest startup passed')
+'''
+    completed = subprocess.run([sys.executable, "-I", "-c", script], check=False, cwd=source,
+                               capture_output=True, text=True, timeout=30)
+    assert completed.returncode == 0, completed.stderr
+    assert "staged manifest startup passed" in completed.stdout
 
 
 def test_permuted_lists_and_mapping_order_produce_identical_bytes(compiler, tmp_path, customer):
@@ -163,7 +296,7 @@ def test_secret_is_reference_only_and_summary_is_sanitized(compiler, tmp_path, c
     assert runtime["definitions"]["secret_scope"] == "analytics-router"
     assert summary == {
         "demo": False,
-        "files": ["customer.resources.yml", "runtime_config.json", "summary.json"],
+        "files": ["customer.resources.yml", "runtime_config.json", "summary.json", "app_source"],
         "permissions": {"app": 1, "dashboard": 1},
         "resource_counts": {"genie_spaces": 2, "secrets": 1, "serving_endpoints": 1,
                             "sql_warehouses": 1, "trace_tables": 1, "uc_functions": 2},
@@ -313,7 +446,6 @@ def test_missing_demo_resources_fail_without_replacing_output(compiler, tmp_path
 
 
 def test_demo_paths_preserve_absolute_remote_and_git_sources(compiler, tmp_path, customer, demo_resources):
-    path = write_config(tmp_path, customer)
     source = yaml.safe_load((demo_resources / "demo.job.yml").read_text())
     source["resources"]["jobs"]["demo_seed"]["tasks"] = [
         {"task_key": "local", "spark_python_task": {"python_file": "../generators/seed.py"}},
@@ -423,12 +555,21 @@ def test_success_replaces_directory_instead_of_overwriting_files(compiler, tmp_p
     compiler.compile_config(path, output, True)
     inode = output.stat().st_ino
     (output / "obsolete.yml").write_text("obsolete: true\n")
-    with (output / "summary.json").open() as old_summary:
+    (output / "app_source/obsolete.py").write_text("PRIVATE_STALE_SOURCE")
+    customer["routing"]["confidence_threshold"] = 0.85
+    write_config(tmp_path, customer)
+    with (output / "summary.json").open() as old_summary, (output / "app_source/runtime_config.json").open() as old_runtime:
         compiler.compile_config(path, output, False)
         assert json.load(old_summary)["demo"] is True
+        assert json.load(old_runtime)["routing"]["confidence_threshold"] == 0.75
 
     assert output.stat().st_ino != inode
-    assert sorted(files(output)) == ["customer.resources.yml", "runtime_config.json", "summary.json"]
+    assert sorted(path.name for path in output.iterdir()) == [
+        "app_source", "customer.resources.yml", "runtime_config.json", "summary.json"
+    ]
+    assert sorted(files(output / "app_source")) == json.loads((SNAPSHOTS / "compiled_app_files.json").read_text())
+    assert (output / "runtime_config.json").read_bytes() == (output / "app_source/runtime_config.json").read_bytes()
+    assert json.loads((output / "app_source/runtime_config.json").read_text())["routing"]["confidence_threshold"] == 0.85
     assert not list(tmp_path.glob(".generated-*"))
 
 
@@ -482,19 +623,20 @@ def test_invalid_config_preserves_existing_output(compiler, tmp_path, customer):
 
 def test_cli_prints_generated_paths_and_redacted_summary(tmp_path, customer, demo_resources):
     shutil.copytree(ROOT / "setup", tmp_path / "setup", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(ROOT / "app", tmp_path / "app", ignore=shutil.ignore_patterns("__pycache__"))
     path = write_config(tmp_path, customer)
     output = tmp_path / ".generated"
     command = [sys.executable, "-m", "setup.compile_config", "--config", str(path), "--output", str(output)]
     env = dict(os.environ, GITHUB_TOKEN="ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE")
-    completed = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True)
+    completed = subprocess.run(command, check=False, cwd=tmp_path, env=env, capture_output=True, text=True)
 
     assert completed.returncode == 0, completed.stderr
-    for name in ("customer.resources.yml", "runtime_config.json", "summary.json"):
+    for name in ("customer.resources.yml", "runtime_config.json", "summary.json", "app_source"):
         assert str(output / name) in completed.stdout
     for forbidden in ("ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE", "01abc", "acme_catalog", "github.com", "analytics-users", "github-token"):
         assert forbidden not in completed.stdout + completed.stderr
     assert json.loads((output / "summary.json").read_text())["demo"] is False
-    demo = subprocess.run(command + ["--demo"], cwd=tmp_path, env=env, capture_output=True, text=True)
+    demo = subprocess.run(command + ["--demo"], check=False, cwd=tmp_path, env=env, capture_output=True, text=True)
     assert demo.returncode == 0, demo.stderr
     assert json.loads((output / "summary.json").read_text())["demo"] is True
     assert "demo_seed" in yaml.safe_load((output / "customer.resources.yml").read_text())["resources"]["jobs"]
@@ -509,7 +651,7 @@ def test_cli_error_does_not_echo_rejected_input(tmp_path, bad_yaml):
     path.write_text(bad_yaml)
     completed = subprocess.run(
         [sys.executable, "-m", "setup.compile_config", "--config", str(path), "--output", str(tmp_path / ".generated")],
-        cwd=ROOT, capture_output=True, text=True,
+        check=False, cwd=ROOT, capture_output=True, text=True,
     )
     assert completed.returncode != 0
     assert "REJECTED_CONTENT" not in completed.stdout + completed.stderr
@@ -524,7 +666,7 @@ def test_cli_rejects_unsupported_options(tmp_path, customer, flag):
     completed = subprocess.run(
         [sys.executable, "-m", "setup.compile_config", "--config", str(path),
          "--output", str(output), flag, "REJECTED_CONTENT"],
-        cwd=ROOT, capture_output=True, text=True,
+        check=False, cwd=ROOT, capture_output=True, text=True,
     )
 
     assert completed.returncode != 0
@@ -568,7 +710,7 @@ def test_local_bundle_loader_loads_generated_resources_without_profile(
     empty_credentials.write_text("")
     completed = subprocess.run(
         [executable, "bundle", "validate", "--strict", "--output", "json"],
-        cwd=tmp_path,
+        check=False, cwd=tmp_path,
         env={"PATH": os.environ["PATH"], "DATABRICKS_CONFIG_FILE": str(empty_credentials)},
         capture_output=True, text=True, timeout=15,
     )

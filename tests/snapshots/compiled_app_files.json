@@ -1,0 +1,18 @@
+[
+  "app.yaml",
+  "app/__init__.py",
+  "app/agent.py",
+  "app/app.py",
+  "app/config.py",
+  "app/definitions.py",
+  "app/genie_client.py",
+  "app/markdown_definitions.py",
+  "app/router.py",
+  "app/runtime_config.py",
+  "app/tracing.py",
+  "app/uc_functions.py",
+  "requirements.txt",
+  "runtime_config.json",
+  "setup/__init__.py",
+  "setup/models.py"
+]

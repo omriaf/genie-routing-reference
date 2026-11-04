@@ -16,6 +16,7 @@ from app.router import RoutingEnrichment
 from app.runtime_config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
+_logging_boundary_lock = Lock()
 TRACE_COLUMNS = {
     "trace_id": "STRING", "question": "STRING", "status": "STRING",
     "domain": "STRING", "confidence": "DOUBLE", "candidates": "STRING",
@@ -27,6 +28,32 @@ TRACE_COLUMNS = {
     "matched_definition_term": "STRING", "enrichment_method": "STRING",
     "answering_genie": "STRING", "config_fingerprint": "STRING",
 }
+
+
+def _protect_mlflow_logs() -> None:
+    """Redact vendor diagnostics before any logger handler sees their contents.
+
+    Exporters log from background workers too, including after a request ends.
+    A persistent record factory covers those threads and future child loggers;
+    filters on the parent logger or a temporary context do not. Only MLflow and
+    OpenTelemetry diagnostics change; App logs keep their messages and context.
+    """
+    with _logging_boundary_lock:
+        previous = logging.getLogRecordFactory()
+        if getattr(previous, "_analytics_mlflow_boundary", False):
+            return
+
+        def make_record(name, level, pathname, lineno, msg, args, exc_info, func=None, sinfo=None, **kwargs):
+            protected = name.split(".", 1)[0] in {"mlflow", "opentelemetry"}
+            if protected:
+                msg, args, exc_info, sinfo = "MLflow tracing diagnostic redacted", (), None, None
+            record = previous(name, level, pathname, lineno, msg, args, exc_info, func, sinfo, **kwargs)
+            if protected:
+                record.exc_text = None
+            return record
+
+        make_record._analytics_mlflow_boundary = True
+        logging.setLogRecordFactory(make_record)
 
 
 def trace_record(result: dict, enrichment: RoutingEnrichment, latency_ms: int) -> dict:
@@ -79,6 +106,7 @@ class TraceRecorder:
         """Ambient Databricks credentials; no tracking profile or workspace default."""
         self._mlflow = None
         try:
+            _protect_mlflow_logs()
             import mlflow
 
             mlflow.set_tracking_uri("databricks")
@@ -101,6 +129,7 @@ class TraceRecorder:
             self.initialize()
         if self._mlflow is not None:
             try:
+                _protect_mlflow_logs()
                 end_time_ns = time.time_ns()
                 span = self._mlflow.start_span_no_context(
                     name="ask_analytics", inputs={"question": result["question"]},

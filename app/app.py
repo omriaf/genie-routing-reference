@@ -1,7 +1,7 @@
 """FastAPI host for the single analytics MCP tool and redacted health contract.
 
-Run from the installed repository with `python -m app.app`. Deployments must
-stage both Python packages (app/ and setup/) and the compiled runtime JSON.
+Run with `python -m app.app`. The compiler stages the complete deployment root
+under .generated/app_source/, including both packages and runtime_config.json.
 """
 
 import logging
