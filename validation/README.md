@@ -54,7 +54,8 @@ outside its scope. Scanning before staging alone is insufficient.
 
 ## Scanner coverage and documented exceptions
 
-`scripts/scan_public_repo.py` uses only Python's standard library and Git. It
+`scripts/scan_public_repo.py` uses Python's standard library, Git and the
+project's existing PyYAML dependency (no additional installation). It
 scans tracked working files, staged blobs, every reachable commit/tree/blob on
 all local refs, commit authors/committers/messages, ref names and annotated tag
 metadata. Deleted historical files still fail. It does not fetch anything or
@@ -73,18 +74,27 @@ new credential formats, arbitrary business prose, encodings, encrypted archives,
 unreachable/reflog-only objects, external repos and local Git configuration are
 outside the gate. A human still reviews the public diff and reachable history.
 
-Unquoted assignment checks tokenize configuration mappings and shell command
-positions rather than requiring a key at the start of a line. Coverage includes
-indented/nested YAML list mappings, flow collections, multiple shell assignments,
-`env`/`export` and common command prefixes, control/grouping constructs, line
-continuations, and `;`, `&&`, `||`, pipe and background separators. Tokens are
-inspected offline; shell text is never expanded or executed. Ordinary prose
-mentions and command arguments are not treated as assignment positions. Quoted
-credential/profile literals remain checked independently, including in source.
-The same detection applies to tracked files, the index and deleted history.
-Only an entire scalar/assignment value may equal a documented placeholder;
-extra words or concatenated private text invalidate the exemption. This is a
-heuristic gate, not a complete YAML or shell interpreter.
+YAML checks compose complete nodes, including block/folded scalars, multiline
+plain/quoted continuations, anchors, aliases, merge keys, nested list mappings
+and flow collections. Composition resolves syntax without constructing objects
+or expanding alias graphs; cycles are visited once. Only the entire resolved
+string may equal a documented placeholder. Trailing newlines, extra words and
+private continuation lines invalidate the exemption. Unknown tags, compound
+credential values and unresolved/malformed YAML candidates cannot establish a
+placeholder exemption. The gate handles complete documents, Markdown fenced
+examples and indented mapping/flow fragments in mixed text.
+
+Generic key/token checks also inspect dotenv/TOML-style settings and shell
+command positions, including multiple assignments, normalized quoted words,
+`env`/`export` and chained command prefixes, redirections and descriptor
+duplication, control/grouping constructs, continuations, and `;`, `&&`, `||`,
+pipe and background separators. Redirection targets are skipped while preserving
+command position; an ordinary command argument is not an assignment. Nothing
+is expanded or executed. Prose mentions are not indiscriminately classified as
+assignments. Quoted credential/profile source literals retain an independent
+check; a composed YAML key/value is judged by its resolved node. The same checks
+apply to tracked files, the index and deleted history. This remains a heuristic
+repository gate rather than a shell interpreter or a proof of sanitization.
 
 For additional **known** non-secret environment values, manually prepare
 `validation/local/deny-values.txt` with one literal per line (at least four
@@ -114,7 +124,9 @@ checking credential-shaped strings into source. Extending an exception requires
 an exact inert value, a documented reason here, and a regression test proving a
 nearby real-looking value still fails.
 Unquoted `null`, `None` and `~` are explicit no-value markers. Their quoted forms
-remain ordinary literals and fail. There is no wildcard placeholder exemption:
+remain ordinary literals and fail. An empty YAML null node is also unconfigured;
+an explicitly typed empty string has no placeholder exemption.
+There is no wildcard placeholder exemption:
 adding private text to an allowed placeholder also fails.
 
 ## Live smoke tool: separately gated

@@ -14,6 +14,8 @@ import shlex
 import subprocess
 import sys
 
+import yaml
+
 
 _SECRET_KEYS = (
     r"(?:DATABRICKS_|GITHUB_|ARM_|AZURE_)?(?:TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET|"
@@ -33,14 +35,16 @@ _ASSIGNMENT_KEYS = {
     "secret-literal": re.compile(r"(?:" + _SECRET_KEYS + r")\Z", re.IGNORECASE),
     "profile-literal": re.compile(r"(?:" + _PROFILE_KEYS + r")\Z", re.IGNORECASE),
 }
-_KEY_HINT = re.compile(r"\b(?:" + _SECRET_KEYS + "|" + _PROFILE_KEYS + r")[\"']?[ \t]*[:=]", re.IGNORECASE)
 _QUOTED_WORD = r'"(?:\\.|[^"\\])*"' + "|" + r"'[^']*'"
 _CONFIG_TOKENS = re.compile(_QUOTED_WORD + r"|[{}\[\],:=()]|[^\s{}\[\],:=()]+")
 _BARE_SCALAR = re.compile(r"[^\s\"'`,;{}()[\]&|]+")
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+_REDIRECTION = r"(?:[0-9]+)?(?:<<<|<<-|<<|>>|<>|>&|<&|>\||[<>])|&>>|&>"
+_REDIRECTION_TOKEN = re.compile("(?:" + _REDIRECTION + r")\Z")
 # Shell words retain quoting/escaping until shlex decodes one word. Operators
 # are separate tokens even without spaces. Nothing is expanded or executed.
 _SHELL_TOKENS = re.compile(
-    r'''&&|\|\||[;&|()]|(?:[^\s;&|()'"\\]+|\\(?:\r?\n|[^\r\n])|"(?:\\[\s\S]|[^"\\])*"|'[^']*')+'''
+    _REDIRECTION + r'''|&&|\|\||[;&|()]|(?:<[A-Za-z_][A-Za-z0-9_-]*>|[^\s;&|()<>'"\\]+|\\(?:\r?\n|[^\r\n])|"(?:\\[\s\S]|[^"\\])*"|'[^']*')+'''
 )
 _SHELL_PREFIXES = {"env", "export", "readonly", "declare", "typeset", "local",
                    "exec", "command", "builtin", "sudo", "nohup", "time"}
@@ -74,7 +78,7 @@ def _logical_lines(contents: str):
         yield start, pending
 
 
-def _mapping_assignments(line: str):
+def _mapping_candidates(line: str):
     tokens = list(_CONFIG_TOKENS.finditer(line))
     containers = []
     for index, token in enumerate(tokens):
@@ -82,7 +86,7 @@ def _mapping_assignments(line: str):
         if word.startswith("#"):
             break
         if word in {"{", "["}:
-            containers.append(word)
+            containers.append(token.start())
         elif word in {"}", "]"} and containers:
             containers.pop()
         key = word[1:-1] if word.startswith(('"', "'")) else word
@@ -98,28 +102,135 @@ def _mapping_assignments(line: str):
         value_start = tokens[index + 1].end()
         while value_start < len(line) and line[value_start] in " \t":
             value_start += 1
-        value = _BARE_SCALAR.match(line, value_start)
-        if value is None or (value.end() < len(line) and line[value.end()] == "("):
-            continue  # Quoted literals are checked separately; calls are not scalars.
-        scalar = value[0]
-        if tokens[index + 1][0] == ":":
-            # YAML plain scalars can contain spaces. Only the whole value may
-            # equal a placeholder; a safe first word cannot hide private text.
-            scalar = line[value_start:].splitlines()[0]
-            if flow_key:
-                scalar = re.split(r"[,}\]]", scalar, maxsplit=1)[0]
-            scalar = re.split(r"[ \t]+#", scalar, maxsplit=1)[0].strip()
-        yield rule, scalar, True, token.start()
+        yield rule, token.start(), tokens[index + 1][0], value_start, containers[0] if flow_key else None
+
+
+def _compose_yaml(contents: str):
+    try:
+        # Composition resolves scalar syntax and aliases, but invokes no value
+        # constructors (including custom tags). Alias graphs are not expanded.
+        return list(yaml.compose_all(contents, Loader=_YAML_LOADER))
+    except (yaml.YAMLError, ValueError, RecursionError):
+        return None
+
+
+def _yaml_regions(contents: str):
+    yield 0, contents
+    opening = None
+    for match in re.finditer(r"(?m)^[ \t]*(`{3,}|~{3,})[^\r\n]*(?:\r?\n|$)", contents):
+        fence = match[1]
+        if opening is None:
+            opening = (fence, match.end())
+        elif (fence[0] == opening[0][0] and len(fence) >= len(opening[0])
+              and not match[0].strip()[len(fence):].strip()):
+            yield opening[1], contents[opening[1]:match.start()]
+            opening = None
+
+
+def _yaml_scalar_is_safe(value, rule: str) -> bool:
+    if not isinstance(value, yaml.ScalarNode):
+        return False
+    if value.tag == "tag:yaml.org,2002:str":
+        return value.value in SYNTHETIC[rule] or (
+            not value.style and value.value in {"null", "None", "~"}
+        )
+    return value.tag == "tag:yaml.org,2002:null" and not value.style and value.value in {"", "null", "~"}
+
+
+def _yaml_assignments(nodes, origin: int):
+    pending, visited = list(nodes), set()
+    while pending:
+        node = pending.pop()
+        if node is None or id(node) in visited:
+            continue
+        visited.add(id(node))  # Aliases/merge keys can share nodes or form cycles.
+        if isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                rule = _assignment_rule(key.value) if isinstance(key, yaml.ScalarNode) else None
+                if rule is not None:
+                    yield rule, _yaml_scalar_is_safe(value, rule), origin + key.start_mark.index
+                pending.extend((key, value))
+        elif isinstance(node, yaml.SequenceNode):
+            pending.extend(node.value)
+
+
+def _yaml_fragment(contents: str, start: int, line: str, key: int, flow: int | None):
+    if flow is not None:
+        origin, depth, comment_end = start + flow, 0, -1
+        for token in _CONFIG_TOKENS.finditer(contents, origin):
+            if token.start() < comment_end:
+                continue
+            if token[0].startswith("#"):
+                comment_end = contents.find("\n", token.end())
+                if comment_end == -1:
+                    break
+            elif token[0] in {"{", "["}:
+                depth += 1
+            elif token[0] in {"}", "]"}:
+                depth -= 1
+                if depth == 0:
+                    return origin, contents[origin:token.end()]
+        return origin, contents[origin:]
+    # Remove list markers while preserving source offsets. Include the entire
+    # indented node, not merely its header/first physical line.
+    fragment = " " * key + line[key:]
+    for following in contents[start + len(line):].splitlines(keepends=True):
+        indent = len(following) - len(following.lstrip(" \t"))
+        if following.strip() and not following.lstrip().startswith("#") and indent <= key:
+            break
+        fragment += following
+    return start, fragment
+
+
+def _yaml_findings(contents: str, location: str):
+    findings, resolved_keys = [], set()
+
+    def inspect(origin, fragment):
+        nodes = _compose_yaml(fragment)
+        if nodes is None:
+            return False
+        for rule, safe, offset in _yaml_assignments(nodes, origin):
+            resolved_keys.add(offset)
+            if not safe:
+                findings.append(Finding(location, rule, contents.count("\n", 0, offset) + 1))
+        return True
+
+    for origin, region in _yaml_regions(contents):
+        if inspect(origin, region) and origin == 0 and len(region) == len(contents):
+            break
+    start = 0
+    for line in contents.splitlines(keepends=True):
+        for rule, key, separator, _, flow in _mapping_candidates(line):
+            offset = start + key
+            # A parsed key owns only its resolved value, not the whole document.
+            # Embedded configuration text still needs generic key detection.
+            if separator != ":" or offset in resolved_keys:
+                continue
+            origin, fragment = _yaml_fragment(contents, start, line, key, flow)
+            if not inspect(origin, fragment):
+                # An unresolved alias or malformed candidate cannot prove an
+                # exact placeholder. Never waive block/anchor/tag prefixes.
+                resolved_keys.add(offset)
+                findings.append(Finding(location, rule, contents.count("\n", 0, offset) + 1))
+        start += len(line)
+    return findings, resolved_keys
 
 
 def _shell_assignments(line: str):
     tokens = list(_SHELL_TOKENS.finditer(line))
     assignment_position, prefix, option_argument = True, None, False
+    redirection_target = False
     for index, token in enumerate(tokens):
         raw = token[0]
         if raw.startswith("#"):
             break
         if raw in {"\\\n", "\\\r\n"}:
+            continue
+        if _REDIRECTION_TOKEN.fullmatch(raw):
+            redirection_target = True
+            continue
+        if redirection_target:
+            redirection_target = False
             continue
         if raw in {";", "&&", "||", "|", "&"}:
             assignment_position, prefix, option_argument = True, None, False
@@ -148,7 +259,7 @@ def _shell_assignments(line: str):
             continue
         key, separator, value = word.partition("=")
         if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and (
-            prefix == "env" or not raw.startswith(('"', "'"))
+            prefix in _DECLARATIONS | {"env"} or not raw.startswith(('"', "'"))
         ):
             # Parentheses adjacent to an unquoted value indicate a source call,
             # not a syntactically valid shell assignment.
@@ -158,7 +269,8 @@ def _shell_assignments(line: str):
             rule = _assignment_rule(key)
             if rule is not None and value:
                 raw_value = raw.partition("=")[2]
-                yield rule, value, not raw_value.startswith(('"', "'")), token.start()
+                bare = not raw.startswith(('"', "'")) and not raw_value.startswith(('"', "'"))
+                yield rule, value, bare, token.start()
             continue  # Subsequent assignments remain in command position.
         command = word.rsplit("/", 1)[-1]
         if command in _SHELL_PREFIXES:
@@ -168,14 +280,20 @@ def _shell_assignments(line: str):
 
 
 def _structured_assignment_findings(contents: str, location: str):
+    findings, resolved_keys = _yaml_findings(contents, location)
     for start, line in _logical_lines(contents):
-        if not _KEY_HINT.search(line):
-            continue
-        for parse in (_mapping_assignments, _shell_assignments):
-            for rule, value, bare, offset in parse(line):
-                if (bare and value in {"null", "None", "~"}) or value in SYNTHETIC[rule]:
-                    continue
-                yield Finding(location, rule, contents.count("\n", 0, start + offset) + 1)
+        assignments = list(_shell_assignments(line))
+        for rule, key, separator, value_start, _ in _mapping_candidates(line):
+            if separator != "=":
+                continue
+            value = _BARE_SCALAR.match(line, value_start)
+            if value is not None and not (value.end() < len(line) and line[value.end()] == "("):
+                assignments.append((rule, value[0], True, key))
+        for rule, value, bare, offset in assignments:
+            if (bare and value in {"null", "None", "~"}) or value in SYNTHETIC[rule]:
+                continue
+            findings.append(Finding(location, rule, contents.count("\n", 0, start + offset) + 1))
+    return findings, resolved_keys
 
 
 RULES = {
@@ -238,12 +356,14 @@ class Finding:
 
 
 def scan_text(contents: str, location: str, denied: tuple[str, ...] = ()) -> list[Finding]:
-    findings = []
+    findings, resolved_keys = _structured_assignment_findings(contents, location)
     for value in denied:
         if value.casefold() in contents.casefold():
             findings.append(Finding(location, "private-deny-value"))
     for rule, pattern in RULES.items():
         for match in pattern.finditer(contents):
+            if rule in _ASSIGNMENT_KEYS and match.start() in resolved_keys:
+                continue  # The fully composed YAML node is authoritative.
             value = next((group for group in match.groups() if group is not None), match[0])
             if rule == "email" and (
                 value.rsplit("@", 1)[1].lower() in {"example.com", "example.org", "example.net"}
@@ -260,7 +380,6 @@ def scan_text(contents: str, location: str, denied: tuple[str, ...] = ()) -> lis
                 ):
                     continue
             findings.append(Finding(location, rule, contents.count("\n", 0, match.start()) + 1))
-    findings.extend(_structured_assignment_findings(contents, location))
     return findings
 
 

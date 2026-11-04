@@ -313,7 +313,7 @@ def test_assignment_words_in_prose_are_not_indiscriminately_flagged(prose):
 
 @pytest.mark.parametrize("key,placeholder", (("profile", "<PROFILE>"), ("password", "<PASSWORD>")))
 def test_yaml_placeholder_must_cover_the_entire_plain_scalar(key, placeholder):
-    for template in ("- {key}: {value}", "{{safe: value, {key}: {value}}}"):
+    for template in ("- {key}: {value}", "{{safe: value, {key}: {value}\n}}"):
         assert not scan.scan_text(template.format(key=key, value=placeholder + " # comment"), "synthetic")
         assert scan.scan_text(template.format(key=key, value=placeholder + " private-suffix"), "synthetic")
 
@@ -354,3 +354,156 @@ def test_every_leading_context_is_scanned_in_index_worktree_and_deleted_blobs(re
     assert scan.main(["--root", str(repository)]) == 1
     output = capsys.readouterr()
     assert value not in output.out + output.err
+
+
+# Physical key lines are independent of the scanner and include alias-use sites.
+NODE_AND_REDIRECTION_MUTATIONS = (
+    ("{key}: |\n  {value}\n", 1),
+    ("{key}: |-\n  {value}\n", 1),
+    ("{key}: |2-\n  {value}\n", 1),
+    ("{key}: >\n  {value}\n", 1),
+    ("{key}: >-\n  {value}\n  second-line\n", 1),
+    ("{key}: &setting {value}\n", 1),
+    ("{key}: &setting |-\n  {value}\n", 1),
+    ("source: &setting {value}\n{key}: *setting\n", 2),
+    ("source: &setting |-\n  {value}\n{key}: *setting\n", 3),
+    ("- {key}: |\n    {value}\n", 1),
+    ("- source: &setting {value}\n  {key}: *setting\n", 2),
+    ("{key}: {placeholder}\n  {value}\n", 1),
+    ("{key}: &setting {placeholder}\n  {value}\n", 1),
+    ("source: &setting {placeholder}\n  {value}\n{key}: *setting\n", 3),
+    ('{key}: "{placeholder}\n  {value}"\n', 1),
+    ("{key}:\n  {value}\n", 1),
+    ('[{{source: &setting {value}, "{key}": *setting}}]', 1),
+    ("source: &setting {{nested: {value}}}\n{key}: *setting\n", 2),
+    ("defaults: &defaults\n  {key}: {value}\nsettings:\n  <<: *defaults\n", 2),
+    ("{key}: [{placeholder}, {value}]", 1),
+    ("embedded: |\n  {key}: {value}\n", 2),
+    ("embedded: |\n  {key}: {placeholder}\n    {value}\n", 2),
+    ("embedded: |\n  {key}: |-\n    {value}\n", 2),
+    ('true; export "{key}={value}"', 1),
+    ("true; export '{key}={value}'", 1),
+    ("true; > /dev/null export {key}={value}", 1),
+    ('true; >/dev/null export "{key}={value}"', 1),
+    ('true && 2>/dev/null export "{key}={value}"', 1),
+    ("false || </dev/null export '{key}={value}'", 1),
+    ('true; command > /dev/null env "{key}={value}" command', 1),
+    ('true; > /dev/null command env "{key}={value}" command', 1),
+    ('true; > /dev/null export SAFE_SETTING=value "{key}={value}" OTHER=value', 1),
+    ('true; exec 2>&1 env "{key}={value}" command', 1),
+    ('true; &>/dev/null export "{key}={value}"', 1),
+    ('true; >|/dev/null export "{key}={value}"', 1),
+    ('true; 3<>/dev/null export "{key}={value}"', 1),
+    ('true; export > /dev/null "{key}={value}"', 1),
+    ('true; env SAFE=value > /dev/null "{key}={value}" command', 1),
+    ('true; env -- "{key}={value}" command', 1),
+    ('true; command builtin export "{key}={value}"', 1),
+    ('true; "export" "{key}={value}"', 1),
+)
+
+
+def node_mutation(template, key):
+    return template.format(key=key, value="synthetic-" + "value",
+                           placeholder="<PROFILE>" if "profile" in key.lower() else "PLACEHOLDER")
+
+
+@pytest.mark.parametrize("key,rule", ASSIGNMENT_CASES)
+@pytest.mark.parametrize("template,line", NODE_AND_REDIRECTION_MUTATIONS)
+def test_complete_nodes_and_shell_redirections(template, line, key, rule):
+    findings = scan.scan_text(node_mutation(template, key), "synthetic")
+    assert (rule, line) in {(item.rule, item.line) for item in findings}
+    assert "synthetic-" + "value" not in repr(findings)
+
+
+@pytest.mark.parametrize("key,placeholder", (("profile", "<PROFILE>"), ("password", "PLACEHOLDER")))
+@pytest.mark.parametrize("template", (
+    "{key}: &setting {placeholder}\n",
+    "source: &setting {placeholder}\n{key}: *setting\n",
+    "source: &setting |-\n  {placeholder}\n{key}: *setting\n",
+    "- {key}: |-\n    {placeholder}\n",
+    "{key}: >-\n  {placeholder}\n",
+    "{key}:\n  {placeholder}\n",
+    "{key}: {placeholder}\n  # comment\nnext: value\n",
+    'true; > /dev/null export "{key}={placeholder}"',
+    'true; exec 2>&1 env "{key}={placeholder}" command',
+    'true; command > /dev/null builtin export "{key}={placeholder}"',
+))
+def test_only_resolved_exact_placeholders_are_exempt(template, key, placeholder):
+    contents = template.format(key=key, placeholder=placeholder)
+    assert not scan.scan_text(contents, "synthetic")
+    assert scan.scan_text(contents.replace(placeholder, placeholder + "-private"), "synthetic")
+
+
+def test_yaml_decoding_and_safe_composition():
+    assert not scan.scan_text('pass' + 'word: "PLACE\\u0048OLDER"\n', "synthetic")
+    for value in ('|\n  PLACEHOLDER\n', '*missing', '&cycle [*cycle]', '!custom PLACEHOLDER', '!!str', '!!str ""'):
+        assert scan.scan_text("pass" + "word: " + value, "synthetic")
+    assert not scan.scan_text('description: &cycle [*cycle]', "synthetic")
+
+
+@pytest.mark.parametrize("key,rule", ASSIGNMENT_CASES)
+def test_shell_normalizes_quoted_keys_before_classification(key, rule):
+    split_key = key[:2] + '"' + key[2:] + '"'
+    text = 'true; command > /dev/null ex"port" ' + split_key + '=' + 'synthetic-' + 'value'
+    assert rule in {finding.rule for finding in scan.scan_text(text, "synthetic")}
+
+
+@pytest.mark.parametrize("loader", (scan.yaml.SafeLoader, scan._YAML_LOADER))
+def test_yaml_composer_backends_and_tags_do_not_construct_objects(loader, monkeypatch):
+    monkeypatch.setattr(scan, "_YAML_LOADER", loader)
+    def forbidden(*args, **kwargs):
+        pytest.fail("YAML value constructors must never run")
+    monkeypatch.setattr(loader, "construct_object", forbidden)
+    for value in ('null', '~', 'None', '&setting PLACEHOLDER', '|-\n  PLACEHOLDER\n'):
+        assert not scan.scan_text('pass' + 'word: ' + value, "synthetic")
+    assert scan.scan_text('pass' + 'word: !custom PLACEHOLDER', "synthetic")
+    assert scan.scan_text('pass' + 'word: PLACEHOLDER\n  private-suffix', "synthetic")
+
+
+def test_yaml_nodes_in_documentation_and_mixed_text():
+    private = "synthetic-" + "value"
+    for prefix, suffix in (("Example:\n```yaml\n", "```\n"), ("echo example\n", "\necho done")):
+        assert scan.scan_text(prefix + "pass" + "word: PLACEHOLDER\n  " + private + "\n" + suffix, "synthetic")
+    assert not scan.scan_text("Example:\n```yaml\nsource: &setting PLACEHOLDER\n" +
+                              "pass" + "word: *setting\n```\n", "synthetic")
+
+
+def test_every_node_and_redirection_mutation_covers_all_git_boundaries(repository, capsys):
+    expected = set()
+    for index, (template, line) in enumerate(NODE_AND_REDIRECTION_MUTATIONS):
+        for key, rule in (("profile", "profile-literal"), ("password", "secret-literal"),
+                          ("DATABRICKS_CLIENT_SECRET", "secret-literal")):
+            name = f"settings-{index}-{key}.txt"
+            contents = node_mutation(template, key)
+            (repository / name).write_text(contents)
+            git(repository, "add", name)
+            oid = git(repository, "rev-parse", ":" + name).strip()
+            expected.add((oid, rule, line))
+    findings, _ = scan.scan_repository(repository)
+    assert expected <= {(item.location.removeprefix("index:"), item.rule, item.line)
+                        for item in findings if item.location.startswith("index:")}
+    # Tracked numbers depend on Git ordering; tie each expected key to its file.
+    paths = git(repository, "ls-files").splitlines()
+    for name in paths:
+        if not name.startswith("settings-"):
+            continue
+        _, index, key = name.removesuffix(".txt").split("-", 2)
+        rule = "profile-literal" if key == "profile" else "secret-literal"
+        assert (f"tracked:{paths.index(name) + 1}", rule, NODE_AND_REDIRECTION_MUTATIONS[int(index)][1]) in {
+            (item.location, item.rule, item.line) for item in findings}
+    for name in paths:
+        if name.startswith("settings-"):
+            (repository / name).write_text("Public replacement\n")
+    findings, _ = scan.scan_repository(repository)
+    assert not any(item.location.startswith("tracked:") for item in findings)
+    assert expected <= {(item.location.removeprefix("index:"), item.rule, item.line)
+                        for item in findings if item.location.startswith("index:")}
+    git(repository, "commit", "-m", "Temporary structured mutations")
+    git(repository, "rm", "--force", "--", *[name for name in paths if name.startswith("settings-")])
+    git(repository, "commit", "-m", "Remove structured mutations")
+    findings, _ = scan.scan_repository(repository)
+    assert expected <= {(item.location.removeprefix("blob:"), item.rule, item.line)
+                        for item in findings if item.location.startswith("blob:")}
+    assert scan.main(["--root", str(repository)]) == 1
+    output = capsys.readouterr()
+    assert "synthetic-" + "value" not in output.out + output.err
