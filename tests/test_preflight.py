@@ -44,6 +44,9 @@ class WorkspaceCLI:
         self.privileges = ("USE_CATALOG", "CREATE_SCHEMA", "USE_SCHEMA", "CREATE_TABLE", "EXECUTE", "MODIFY", "MANAGE")
         self.missing_status_column = False
         self.overrides = {}
+        self.permission_overrides = {}
+        self.grant_overrides = {}
+        self.owner = "data-owner"
 
     def __call__(self, args, **kwargs):
         assert kwargs["capture_output"] and kwargs["text"]
@@ -66,9 +69,9 @@ class WorkspaceCLI:
         elif (family, operation) == ("serving-endpoints", "get"):
             data = {"id": "endpoint-id", "name": values[0]}
         elif operation == "get-permissions" or (family, operation) == ("permissions", "get"):
-            data = {"access_control_list": [{"group_name": "installers", "all_permissions": [
+            data = self.permission_overrides.get(tuple(command), {"access_control_list": [{"group_name": "installers", "all_permissions": [
                 {"permission_level": "CAN_MANAGE", "inherited": False},
-            ]}]}
+            ]}]})
         elif (family, operation) == ("genie", "get-space"):
             data = {"space_id": values[0]}
         elif family in {"catalogs", "schemas", "functions", "tables"} and operation == "get":
@@ -76,7 +79,7 @@ class WorkspaceCLI:
                 family == "tables" and self.missing_table
             ):
                 return subprocess.CompletedProcess(args, 1, "", "RESOURCE_DOES_NOT_EXIST")
-            data = {"full_name": values[0], "owner": "data-owner"}
+            data = {"full_name": values[0], "owner": self.owner}
             if family == "tables":
                 from app.tracing import TRACE_COLUMNS
 
@@ -86,10 +89,12 @@ class WorkspaceCLI:
                 data["data_source_format"] = "DELTA"
         elif (family, operation) == ("grants", "get-effective"):
             data = {"privilege_assignments": [{"principal": "installers", "privileges": [
-                {"privilege": p} for p in self.privileges
+                {"privilege": p} for p in self.grant_overrides.get(tuple(values[:2]), self.privileges)
             ]}]}
         elif (family, operation) == ("secrets", "list-secrets"):
             data = [] if self.missing_secret else [{"key": "github-token", "last_updated_timestamp": 1}]
+        elif (family, operation) == ("secrets", "list-acls"):
+            data = [{"principal": "installers", "permission": "MANAGE"}]
         else:
             raise AssertionError(f"Unexpected or unsafe CLI command: {command}")
         return subprocess.CompletedProcess(args, 0, json.dumps(data), "")
@@ -118,6 +123,7 @@ def test_preflight_compiles_and_checks_every_external_reference(preflight, custo
     assert ["functions", "get", "acme_catalog.metrics.monthly_revenue"] in commands
     assert ["functions", "get", "acme_catalog.metrics.resolution_time"] in commands
     assert ["secrets", "list-secrets", "analytics-router"] in commands
+    assert ["secrets", "list-acls", "analytics-router"] in commands
     assert "PASS" in capsys.readouterr().out
 
 
@@ -125,7 +131,7 @@ def test_preflight_compiles_and_checks_every_external_reference(preflight, custo
     ("current-user", "me"), ("warehouses", "get"), ("warehouses", "get-permissions"),
     ("serving-endpoints", "get"), ("serving-endpoints", "get-permissions"),
     ("genie", "get-space"), ("permissions", "get"), ("functions", "get"),
-    ("catalogs", "get"), ("grants", "get-effective"), ("secrets", "list-secrets"),
+    ("catalogs", "get"), ("grants", "get-effective"), ("secrets", "list-secrets"), ("secrets", "list-acls"),
 ])
 def test_preflight_fails_closed_and_redacts_backend_errors(preflight, customer_file, tmp_path, monkeypatch, capsys, denied):
     cli = WorkspaceCLI()
@@ -168,6 +174,149 @@ def test_invalid_config_never_contacts_workspace(preflight, customer_file, tmp_p
     assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 1
     assert not cli.calls
     assert "SENSITIVE_CUSTOMER_INPUT" not in str(capsys.readouterr())
+
+
+@pytest.mark.parametrize("command,usage,resource", [
+    (("warehouses", "get-permissions", "abc123"), "CAN_USE", "SQL warehouse 'sql_warehouse'"),
+    (("serving-endpoints", "get-permissions", "endpoint-id"), "CAN_QUERY", "serving endpoint 'classifier_endpoint'"),
+    (("permissions", "get", "genie", "01abc000000000000000000000000001"), "CAN_RUN", "Genie Agent 'sales'"),
+    (("permissions", "get", "genie", "01abc000000000000000000000000002"), "CAN_EDIT", "Genie Agent 'support'"),
+])
+def test_usage_only_installer_cannot_delegate_app_binding(preflight, customer_file, tmp_path, monkeypatch, capsys, command, usage, resource):
+    cli = WorkspaceCLI()
+    cli.permission_overrides[command] = {"access_control_list": [
+        {"user_name": "installer@example.com", "all_permissions": [{"permission_level": usage}]},
+        {"user_name": "other@example.com", "all_permissions": [{"permission_level": "CAN_MANAGE"}]},
+    ]}
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 1
+    diagnostic = capsys.readouterr().err
+    assert resource in diagnostic
+    assert "CAN_MANAGE" in diagnostic and "rerun" in diagnostic
+    assert "other@example.com" not in diagnostic
+
+
+@pytest.mark.parametrize("permission", ["READ", "WRITE"])
+def test_secret_read_or_write_cannot_delegate_app_binding(preflight, customer_file, tmp_path, monkeypatch, capsys, permission):
+    cli = WorkspaceCLI()
+    # Key listing succeeds, but only another principal has permission to grant.
+    cli.overrides[("secrets", "list-acls")] = [
+        {"principal": "installer@example.com", "permission": permission},
+        {"principal": "other@example.com", "permission": "MANAGE"},
+    ]
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 1
+    diagnostic = capsys.readouterr().err
+    assert "secret scope 'definitions_secret'" in diagnostic
+    assert "MANAGE" in diagnostic and "rerun" in diagnostic
+    assert "other@example.com" not in diagnostic
+
+
+@pytest.mark.parametrize("command,resource,required", [
+    (("warehouses", "get-permissions"), "SQL warehouse 'sql_warehouse'", "CAN_MANAGE"),
+    (("serving-endpoints", "get-permissions"), "serving endpoint 'classifier_endpoint'", "CAN_MANAGE"),
+    (("permissions", "get"), "Genie Agent 'sales'", "CAN_MANAGE"),
+    (("secrets", "list-acls"), "secret scope 'definitions_secret'", "MANAGE"),
+])
+def test_unreadable_delegation_metadata_fails_with_context(preflight, customer_file, tmp_path, monkeypatch, capsys, command, resource, required):
+    cli = WorkspaceCLI()
+    cli.denied = command
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 1
+    diagnostic = capsys.readouterr().err
+    assert resource in diagnostic and required in diagnostic
+    assert "ACL" in diagnostic and "rerun" in diagnostic
+    assert "SENSITIVE_BACKEND_PAYLOAD" not in diagnostic
+
+
+@pytest.mark.parametrize("identity,principal_key,principal,secret_acl", [
+    ({"userName": "installer@example.com", "groups": []}, "user_name", "installer@example.com",
+     [{"principal": "installer@example.com", "permission": "MANAGE"}]),
+    ({"userName": "installer@example.com", "groups": [{"display": "installers"}]}, "group_name", "installers",
+     {"acls": [{"principal": "installers", "permission": "MANAGE"}]}),
+    ({"userName": "service-principal-display-name", "applicationId": "installer-client-id", "groups": []},
+     "service_principal_name", "installer-client-id", [{"principal": "installer-client-id", "permission": "MANAGE"}]),
+    ({"userName": "admin@example.com", "groups": [{"display": "admins"}]}, "group_name", "admins",
+     [{"principal": "admins", "permission": "MANAGE"}]),
+])
+def test_matching_manager_can_delegate_all_bindings(preflight, customer_file, tmp_path, monkeypatch, capsys, identity, principal_key, principal, secret_acl):
+    cli = WorkspaceCLI()
+    cli.overrides[("current-user", "me")] = identity
+    manager = {"access_control_list": [{principal_key: principal, "all_permissions": [
+        {"permission_level": "CAN_MANAGE", "inherited": True, "inherited_from_object": ["/root"]},
+    ]}]}
+    for command in (("warehouses", "get-permissions"), ("serving-endpoints", "get-permissions"), ("permissions", "get")):
+        cli.overrides[command] = manager
+    cli.overrides[("secrets", "list-acls")] = secret_acl
+    # Keep UC ownership independent of the workspace ACL identity fixture.
+    for family in ("catalogs", "schemas", "functions"):
+        cli.overrides[(family, "get")] = {"owner": principal}
+    cli.missing_table = True
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 0
+    assert "PASS" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("unverifiable", [[], {}, {"acls": []}, [{"principal": "unknown-group", "permission": "MANAGE"}]])
+def test_secret_delegation_is_not_assumed_when_acl_cannot_prove_it(preflight, customer_file, tmp_path, monkeypatch, capsys, unverifiable):
+    cli = WorkspaceCLI()
+    cli.overrides[("secrets", "list-acls")] = unverifiable
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 1
+    diagnostic = capsys.readouterr().err
+    assert "secret scope 'definitions_secret'" in diagnostic and "MANAGE" in diagnostic
+
+
+def test_warehouse_owner_can_delegate_bindings(preflight, customer_file, tmp_path, monkeypatch):
+    cli = WorkspaceCLI()
+    cli.overrides[("warehouses", "get-permissions")] = {"access_control_list": [{
+        "user_name": "installer@example.com", "all_permissions": [{"permission_level": "IS_OWNER"}],
+    }]}
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 0
+
+
+@pytest.mark.parametrize("kind,name,missing,missing_schema,missing_table", [
+    ("catalog", "acme_catalog", "CREATE_SCHEMA", True, True),
+    ("schema", "acme_catalog.analytics_router", "CREATE_TABLE", False, True),
+    ("schema", "acme_catalog.analytics_router", "MANAGE", False, False),
+    ("table", "acme_catalog.analytics_router.routing_traces", "MODIFY", False, False),
+    ("table", "acme_catalog.analytics_router.routing_traces", "MANAGE", False, False),
+])
+def test_bootstrap_and_trace_authority_remains_required(preflight, customer_file, tmp_path, monkeypatch, capsys, kind, name, missing, missing_schema, missing_table):
+    cli = WorkspaceCLI()
+    cli.missing_schema, cli.missing_table = missing_schema, missing_table
+    cli.grant_overrides[(kind, name)] = tuple(privilege for privilege in cli.privileges if privilege != missing)
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 1
+    diagnostic = capsys.readouterr().err
+    assert f"UC {kind} '{name}'" in diagnostic
+    assert missing in diagnostic and "rerun" in diagnostic
+
+
+@pytest.mark.parametrize("owner", ["installer@example.com", "installers"])
+def test_verified_uc_owner_satisfies_bootstrap_and_trace_authority(preflight, customer_file, tmp_path, monkeypatch, owner):
+    cli = WorkspaceCLI()
+    cli.owner = owner
+    cli.privileges = ()
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 0
+
+
+@pytest.mark.parametrize("family,resource", [
+    ("catalogs", "UC catalog 'acme_catalog'"),
+    ("schemas", "UC schema 'acme_catalog.analytics_router'"),
+    ("tables", "UC table 'acme_catalog.analytics_router.routing_traces'"),
+    ("functions", "UC function 'acme_catalog.metrics.monthly_revenue'"),
+])
+def test_unreadable_uc_metadata_fails_with_resource_and_remediation(preflight, customer_file, tmp_path, monkeypatch, capsys, family, resource):
+    cli = WorkspaceCLI()
+    cli.denied = (family, "get")
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "out"), "--profile", "chosen"]) == 1
+    diagnostic = capsys.readouterr().err
+    assert resource in diagnostic and "ACL" in diagnostic and "rerun" in diagnostic
+    assert "SENSITIVE_BACKEND_PAYLOAD" not in diagnostic
 
 
 def test_catalog_traversal_grants_require_authority_to_grant(preflight, customer_file, tmp_path, monkeypatch):

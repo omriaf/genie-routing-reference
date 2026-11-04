@@ -9,6 +9,7 @@ import json
 import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from setup.compile_config import _ArgumentParser, compile_config
@@ -16,7 +17,7 @@ from setup.models import RouterPackageConfig, load_customer_config
 
 
 class CheckFailure(Exception):
-    """Only fixed, non-sensitive labels may leave this boundary."""
+    """Only redacted diagnostics and validated logical names leave this boundary."""
 
 
 class CLI:
@@ -59,7 +60,7 @@ class CLI:
         except (ValueError, TypeError):
             raise CheckFailure("CLI metadata response") from None
         if not isinstance(data, dict) and not (
-            arguments[:2] == ("secrets", "list-secrets")
+            arguments[:2] in {("secrets", "list-secrets"), ("secrets", "list-acls")}
             and isinstance(data, list) and all(isinstance(item, dict) for item in data)
         ):
             raise CheckFailure("CLI metadata response")
@@ -80,34 +81,61 @@ def _acl(data: dict, principals: set[str], allowed: set[str]) -> None:
     raise CheckFailure("resource access permissions")
 
 
+@contextmanager
+def _delegation_check(resource: str, required: str):
+    """Do not mistake usage, missing ACLs, or unreadable metadata for delegation."""
+    try:
+        yield
+    except (CheckFailure, AttributeError, KeyError, TypeError) as error:
+        reason = str(error) if isinstance(error, CheckFailure) else "malformed ACL or resource metadata"
+        raise CheckFailure(
+            f"{resource}: {reason}. Cannot verify installer delegation authority; "
+            f"requires {required} in readable ACL metadata. Ask a resource owner/admin "
+            "to grant the selected installer or its deployment group that authority, "
+            "then rerun preflight."
+        ) from None
+
+
+def _secret_acl(data, principals: set[str]) -> None:
+    # list-acls is metadata-only and itself requires MANAGE. Also require a
+    # matching ACL instead of guessing unexposed admin or nested-group authority.
+    entries = data.get("acls", []) if isinstance(data, dict) else data
+    if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        raise CheckFailure("malformed secret scope ACL metadata")
+    if not any(entry.get("principal") in principals and entry.get("permission") == "MANAGE"
+               for entry in entries):
+        raise CheckFailure("installer MANAGE is not recorded in the scope ACL")
+
+
 def _uc(cli: CLI, kind: str, name: str, metadata: dict, principals: set[str], required: set[str]):
-    if metadata.get("owner") in principals:
-        return
-    granted = set()
-    token = None
-    seen = set()
-    while True:
-        arguments = ["grants", "get-effective", kind, name, "--max-results", "0"]
-        if token:
-            arguments.extend(["--page-token", token])
-        data = cli.metadata(*arguments)
-        for assignment in data.get("privilege_assignments", []):
-            if assignment.get("principal") in principals:
-                for item in assignment.get("privileges", []):
-                    privilege = item.get("privilege") if isinstance(item, dict) else item
-                    if isinstance(privilege, str):
-                        granted.add(privilege.replace(" ", "_"))
-        token = data.get("next_page_token")
-        if not token:
-            break
-        if not isinstance(token, str) or token in seen:
-            raise CheckFailure("UC permission pagination")
-        seen.add(token)
-    # MANAGE is not a data privilege. ALL_PRIVILEGES excludes MANAGE.
-    if "ALL_PRIVILEGES" in granted:
-        granted.update(required - {"MANAGE"})
-    if not required <= granted:
-        raise CheckFailure("UC access permissions")
+    with _delegation_check(f"UC {kind} '{name}'", " and ".join(sorted(required)) + " or ownership"):
+        if metadata.get("owner") in principals:
+            return
+        granted = set()
+        token = None
+        seen = set()
+        while True:
+            arguments = ["grants", "get-effective", kind, name, "--max-results", "0"]
+            if token:
+                arguments.extend(["--page-token", token])
+            data = cli.metadata(*arguments)
+            for assignment in data.get("privilege_assignments", []):
+                if assignment.get("principal") in principals:
+                    for item in assignment.get("privileges", []):
+                        privilege = item.get("privilege") if isinstance(item, dict) else item
+                        if isinstance(privilege, str):
+                            granted.add(privilege.replace(" ", "_"))
+            token = data.get("next_page_token")
+            if not token:
+                break
+            if not isinstance(token, str) or token in seen:
+                raise CheckFailure("UC permission pagination")
+            seen.add(token)
+        # MANAGE is not a data privilege. ALL_PRIVILEGES excludes MANAGE.
+        if "ALL_PRIVILEGES" in granted:
+            granted.update(required - {"MANAGE"})
+        if not required <= granted:
+            raise CheckFailure("UC access permissions")
 
 
 def _trace_table(metadata: dict) -> None:
@@ -130,25 +158,32 @@ def check_workspace(cli: CLI, config: RouterPackageConfig) -> list[str]:
         raise CheckFailure("authenticated identity")
     notes = []
     workspace = config.workspace
-    warehouse = cli.metadata("warehouses", "get", workspace.warehouse_id)
-    if warehouse.get("warehouse_type") != "PRO" and not warehouse.get("enable_serverless_compute"):
-        raise CheckFailure("bootstrap requires a Pro or Serverless SQL warehouse")
-    _acl(cli.metadata("warehouses", "get-permissions", workspace.warehouse_id), principals,
-         {"CAN_USE", "CAN_MANAGE", "IS_OWNER"})
-    endpoint = cli.metadata("serving-endpoints", "get", workspace.classifier_endpoint)
-    endpoint_id = endpoint.get("id")
-    if not isinstance(endpoint_id, str) or not endpoint_id:
-        raise CheckFailure("model endpoint metadata")
-    _acl(cli.metadata("serving-endpoints", "get-permissions", endpoint_id), principals,
-         {"CAN_QUERY", "CAN_MANAGE", "IS_OWNER"})
+    # ACL permission tables document management separately from resource usage:
+    # https://docs.databricks.com/aws/en/security/auth/access-control
+    with _delegation_check("SQL warehouse 'sql_warehouse'", "CAN_MANAGE or IS_OWNER"):
+        warehouse = cli.metadata("warehouses", "get", workspace.warehouse_id)
+        if warehouse.get("warehouse_type") != "PRO" and not warehouse.get("enable_serverless_compute"):
+            raise CheckFailure("bootstrap requires a Pro or Serverless SQL warehouse")
+        _acl(cli.metadata("warehouses", "get-permissions", workspace.warehouse_id), principals,
+             {"CAN_MANAGE", "IS_OWNER"})
+    with _delegation_check("serving endpoint 'classifier_endpoint'", "CAN_MANAGE"):
+        endpoint = cli.metadata("serving-endpoints", "get", workspace.classifier_endpoint)
+        endpoint_id = endpoint.get("id")
+        if not isinstance(endpoint_id, str) or not endpoint_id:
+            raise CheckFailure("model endpoint metadata")
+        _acl(cli.metadata("serving-endpoints", "get-permissions", endpoint_id), principals,
+             {"CAN_MANAGE"})
     for agent in config.genie_agents:
-        cli.metadata("genie", "get-space", agent.space_id)
-        _acl(cli.metadata("permissions", "get", "genie", agent.space_id), principals,
-             {"CAN_RUN", "CAN_EDIT", "CAN_MANAGE", "IS_OWNER"})
+        with _delegation_check(f"Genie Agent '{agent.name}'", "CAN_MANAGE"):
+            cli.metadata("genie", "get-space", agent.space_id)
+            _acl(cli.metadata("permissions", "get", "genie", agent.space_id), principals,
+                 {"CAN_MANAGE"})
 
-    catalog = cli.metadata("catalogs", "get", workspace.catalog)
+    with _delegation_check(f"UC catalog '{workspace.catalog}'", "USE_CATALOG and MANAGE or ownership"):
+        catalog = cli.metadata("catalogs", "get", workspace.catalog)
     schema_name = f"{workspace.catalog}.{workspace.router_schema}"
-    schema = cli.metadata("schemas", "get", schema_name, optional=True)
+    with _delegation_check(f"UC schema '{schema_name}'", "USE_SCHEMA and MANAGE or ownership"):
+        schema = cli.metadata("schemas", "get", schema_name, optional=True)
     catalog_required = {"USE_CATALOG", "MANAGE"}
     if schema is None:
         catalog_required.add("CREATE_SCHEMA")
@@ -156,7 +191,8 @@ def check_workspace(cli: CLI, config: RouterPackageConfig) -> list[str]:
     _uc(cli, "catalog", workspace.catalog, catalog, principals, catalog_required)
     if schema is not None:
         table_name = f"{schema_name}.routing_traces"
-        table = cli.metadata("tables", "get", table_name, optional=True)
+        with _delegation_check(f"UC table '{table_name}'", "MODIFY and MANAGE or ownership"):
+            table = cli.metadata("tables", "get", table_name, optional=True)
         schema_required = {"USE_SCHEMA", "MANAGE"}
         if table is None:
             schema_required.add("CREATE_TABLE")
@@ -167,15 +203,19 @@ def check_workspace(cli: CLI, config: RouterPackageConfig) -> list[str]:
             _uc(cli, "table", table_name, table, principals, {"MODIFY", "MANAGE"})
 
     for function in config.uc_functions:
-        function_metadata = cli.metadata("functions", "get", function.full_name)
+        with _delegation_check(f"UC function '{function.full_name}'", "EXECUTE and MANAGE or ownership"):
+            function_metadata = cli.metadata("functions", "get", function.full_name)
         function_schema = ".".join(function.full_name.split(".")[:2])
-        parent = cli.metadata("schemas", "get", function_schema)
+        with _delegation_check(f"UC schema '{function_schema}'", "USE_SCHEMA and MANAGE or ownership"):
+            parent = cli.metadata("schemas", "get", function_schema)
         _uc(cli, "schema", function_schema, parent, principals, {"USE_SCHEMA", "MANAGE"})
         _uc(cli, "function", function.full_name, function_metadata, principals, {"EXECUTE", "MANAGE"})
-    secrets = cli.metadata("secrets", "list-secrets", config.definitions.secret_scope)
-    keys = secrets.get("secrets", []) if isinstance(secrets, dict) else secrets
-    if not isinstance(keys, list) or not any(item.get("key") == config.definitions.secret_key for item in keys):
-        raise CheckFailure("Git secret key metadata")
+    with _delegation_check("secret scope 'definitions_secret'", "MANAGE"):
+        _secret_acl(cli.metadata("secrets", "list-acls", config.definitions.secret_scope), principals)
+        secrets = cli.metadata("secrets", "list-secrets", config.definitions.secret_scope)
+        keys = secrets.get("secrets", []) if isinstance(secrets, dict) else secrets
+        if not isinstance(keys, list) or not any(item.get("key") == config.definitions.secret_key for item in keys):
+            raise CheckFailure("Git secret key metadata")
     return notes
 
 
@@ -205,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     except (AttributeError, KeyError, TypeError):
         print("FAIL: malformed workspace metadata", file=sys.stderr)
         return 1
-    print("PASS: configuration, CLI, auth, resource metadata, ACLs, UC permissions, secret key metadata")
+    print("PASS: configuration, CLI, auth, resource metadata, installer delegation ACLs, UC permissions, secret key metadata")
     for note in notes:
         print(f"NOTE: {note}")
     return 0
