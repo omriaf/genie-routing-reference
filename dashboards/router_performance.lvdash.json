@@ -1,0 +1,279 @@
+{
+  "datasets": [
+    {
+      "name": "routing",
+      "displayName": "Router traces",
+      "queryLines": [
+        "SELECT request_ts, trace_id, route, domain, latency_ms,\n",
+        "       CASE WHEN fail_loud OR status = 'error' THEN 1.0 ELSE 0.0 END AS failed,\n",
+        "       CASE WHEN git_definition_used THEN 1.0 ELSE 0.0 END AS definition_used,\n",
+        "       CASE WHEN mlflow_trace_ok THEN 1.0 ELSE 0.0 END AS mlflow_ok\n",
+        "FROM routing_traces\n",
+        "WHERE request_ts >= date_sub(current_date(), 30)"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "performance",
+      "displayName": "Router performance",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Router performance\n",
+                "\n",
+                "Last 30 days. Latency covers routing and answering; requests are counted when trace rows persist."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "requests",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "routing",
+                  "fields": [
+                    {
+                      "name": "requests",
+                      "expression": "COUNT(`trace_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "requests",
+                  "displayName": "Requests",
+                  "format": {
+                    "type": "number",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 0
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "title": "Requests",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "latency",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "routing",
+                  "fields": [
+                    {
+                      "name": "latency",
+                      "expression": "AVG(`latency_ms`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "latency",
+                  "displayName": "Average latency (ms)",
+                  "format": {
+                    "type": "number",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 0
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "title": "Average latency (ms)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "failures",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "routing",
+                  "fields": [
+                    {
+                      "name": "failures",
+                      "expression": "AVG(`failed`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "failures",
+                  "displayName": "Failure rate",
+                  "format": {
+                    "type": "number-percent",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 1
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "title": "Failure rate",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 2,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "routes",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "routing",
+                  "fields": [
+                    {
+                      "name": "route",
+                      "expression": "`route`"
+                    },
+                    {
+                      "name": "domain",
+                      "expression": "`domain`"
+                    },
+                    {
+                      "name": "requests",
+                      "expression": "COUNT(`trace_id`)"
+                    },
+                    {
+                      "name": "latency_ms",
+                      "expression": "AVG(`latency_ms`)"
+                    },
+                    {
+                      "name": "failure_rate",
+                      "expression": "AVG(`failed`)"
+                    },
+                    {
+                      "name": "definitions_rate",
+                      "expression": "AVG(`definition_used`)"
+                    },
+                    {
+                      "name": "mlflow_rate",
+                      "expression": "AVG(`mlflow_ok`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "route",
+                    "displayName": "Route"
+                  },
+                  {
+                    "fieldName": "domain",
+                    "displayName": "Domain"
+                  },
+                  {
+                    "fieldName": "requests",
+                    "displayName": "Requests"
+                  },
+                  {
+                    "fieldName": "latency_ms",
+                    "displayName": "Average latency (ms)",
+                    "format": {"type": "number", "decimalPlaces": {"type": "max", "places": 0}}
+                  },
+                  {
+                    "fieldName": "failure_rate",
+                    "displayName": "Failure rate",
+                    "format": {"type": "number-percent", "decimalPlaces": {"type": "max", "places": 1}}
+                  },
+                  {
+                    "fieldName": "definitions_rate",
+                    "displayName": "Definitions usage",
+                    "format": {"type": "number-percent", "decimalPlaces": {"type": "max", "places": 1}}
+                  },
+                  {
+                    "fieldName": "mlflow_rate",
+                    "displayName": "MLflow persistence",
+                    "format": {"type": "number-percent", "decimalPlaces": {"type": "max", "places": 1}}
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Routes, failures, and definitions usage",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 12,
+            "height": 6
+          }
+        }
+      ]
+    }
+  ]
+}

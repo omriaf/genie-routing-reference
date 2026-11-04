@@ -1,0 +1,4 @@
+resources:
+  apps:
+    router_app:
+      description: Customer-configured analytics router with referenced Genie spaces and functions

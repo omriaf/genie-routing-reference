@@ -1,0 +1,6 @@
+resources:
+  dashboards:
+    router_dashboard:
+      display_name: ${bundle.name}-${bundle.target}-performance
+      file_path: ../dashboards/router_performance.lvdash.json
+      embed_credentials: false

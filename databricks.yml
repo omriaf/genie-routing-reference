@@ -1,5 +1,20 @@
 bundle:
   name: genie-routing-reference
+  databricks_cli_version: '>= 1.0.0'
 
 include:
   - .generated/customer.resources.yml
+
+# Compile first. Generated App sources are intentionally ignored by Git.
+sync:
+  include:
+    - .generated/app_source/**
+  exclude:
+    - customer_config/**
+    - tests/**
+    - .venv/**
+
+# Every supported command must supply --target customer --profile <PROFILE>.
+# No workspace/profile or default target is committed.
+targets:
+  customer: {}

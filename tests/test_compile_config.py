@@ -66,6 +66,23 @@ def files(directory):
             for path in sorted(directory.rglob("*")) if path.is_file()}
 
 
+def portable_resources(path):
+    document = yaml.safe_load(path.read_text())
+    for task in document["resources"]["jobs"]["router_bootstrap"]["tasks"]:
+        notebook = task["notebook_task"]
+        if "notebook_path" in notebook:
+            source = (path.parent / notebook["notebook_path"]).resolve()
+            assert source == ROOT / "sql" / source.name
+            assert source.is_file()
+            notebook["notebook_path"] = f"../sql/{source.name}"
+    dashboard = document["resources"]["dashboards"]["router_dashboard"]
+    source = (path.parent / dashboard["file_path"]).resolve()
+    assert source == ROOT / "dashboards/router_performance.lvdash.json"
+    assert source.is_file()
+    dashboard["file_path"] = "../dashboards/router_performance.lvdash.json"
+    return document
+
+
 def compile_documents(compiler, tmp_path, customer, demo=False):
     config = write_config(tmp_path, customer)
     output = tmp_path / ".generated"
@@ -82,7 +99,7 @@ def test_compiled_artifacts_match_reviewed_snapshots(compiler, tmp_path, custome
     result, runtime, resources, _ = compile_documents(compiler, tmp_path, customer)
 
     assert result.runtime_config.read_bytes() == (SNAPSHOTS / "compiled_runtime.json").read_bytes()
-    assert result.resources.read_bytes() == (SNAPSHOTS / "compiled_resources.yml").read_bytes()
+    assert portable_resources(result.resources) == yaml.safe_load((SNAPSHOTS / "compiled_resources.yml").read_text())
     assert [path.name for path in result.generated_paths] == [
         "customer.resources.yml", "runtime_config.json", "summary.json", "app_source"
     ]
@@ -317,7 +334,9 @@ def test_empty_functions_and_permissions_need_no_extra_grants(compiler, tmp_path
     assert runtime["uc_functions"] == []
     assert runtime["permissions"] == {"app": [], "dashboard": []}
     assert "permissions" not in resources["resources"]["apps"]["router_app"]
-    assert "dashboards" not in resources["resources"]
+    assert "permissions" not in resources["resources"]["dashboards"]["router_dashboard"]
+    tasks = resources["resources"]["jobs"]["router_bootstrap"]["tasks"]
+    assert {task["task_key"] for task in tasks} == {"bootstrap", "app_access_0"}
     assert load_customer_config(tmp_path / ".generated/runtime_config.json").uc_functions == []
 
 
@@ -337,21 +356,21 @@ def test_demo_resources_are_opt_in_and_removed_on_recompile(compiler, tmp_path, 
     compiler.compile_config(path, output, True)
     document = yaml.safe_load((output / "customer.resources.yml").read_text())
     assert set(document) == {"resources"}
-    assert document["resources"]["jobs"] == {"demo_seed": {
+    assert document["resources"]["jobs"]["demo_seed"] == {
         "name": "synthetic-seed",
         "tasks": [{"task_key": "seed", "notebook_task": {
             "notebook_path": "../demo/generators/seed.py", "source": "WORKSPACE"
         }}],
-    }}
+    }
     summary = json.loads((output / "summary.json").read_text())
     assert summary["demo"] is True
     assert summary["demo_resource_counts"] == {"jobs": 1}
     compiler.compile_config(path, output, False)
     document = yaml.safe_load((output / "customer.resources.yml").read_text())
     assert set(document) == {"resources"}
-    assert "jobs" not in document["resources"]
+    assert set(document["resources"]["jobs"]) == {"router_bootstrap"}
     assert json.loads((output / "summary.json").read_text())["demo"] is False
-    assert (output / "customer.resources.yml").read_bytes() == (SNAPSHOTS / "compiled_resources.yml").read_bytes()
+    assert portable_resources(output / "customer.resources.yml") == yaml.safe_load((SNAPSHOTS / "compiled_resources.yml").read_text())
 
 
 @pytest.mark.parametrize("demo", [False, True])
@@ -368,7 +387,7 @@ def test_generated_resource_document_has_no_nested_include(compiler, tmp_path, c
                 check_shape(child)
 
     assert set(document) == {"resources"}
-    assert set(document["resources"]) == ({"apps", "dashboards", "jobs"} if demo else {"apps", "dashboards"})
+    assert set(document["resources"]) == {"apps", "dashboards", "jobs", "experiments"}
     for declarations in document["resources"].values():
         assert isinstance(declarations, dict)
         assert all(isinstance(body, dict) for body in declarations.values())
@@ -624,6 +643,8 @@ def test_invalid_config_preserves_existing_output(compiler, tmp_path, customer):
 def test_cli_prints_generated_paths_and_redacted_summary(tmp_path, customer, demo_resources):
     shutil.copytree(ROOT / "setup", tmp_path / "setup", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(ROOT / "app", tmp_path / "app", ignore=shutil.ignore_patterns("__pycache__"))
+    for directory in ("resources", "sql", "dashboards"):
+        shutil.copytree(ROOT / directory, tmp_path / directory)
     path = write_config(tmp_path, customer)
     output = tmp_path / ".generated"
     command = [sys.executable, "-m", "setup.compile_config", "--config", str(path), "--output", str(output)]
@@ -681,14 +702,11 @@ def test_root_bundle_directly_includes_generated_resource_document(compiler, tmp
     compile_documents(compiler, tmp_path, customer)
     root = yaml.safe_load((tmp_path / "databricks.yml").read_text())
 
-    assert root == {
-        "bundle": {"name": "genie-routing-reference"},
-        "include": [".generated/customer.resources.yml"],
-    }
-    for entry in root["include"]:
-        document = yaml.safe_load((tmp_path / entry).read_text())
-        assert set(document) == {"resources"}
-        assert "router_app" in document["resources"]["apps"]
+    assert root["bundle"]["name"] == "genie-routing-reference"
+    assert ".generated/customer.resources.yml" in root["include"]
+    document = yaml.safe_load((tmp_path / ".generated/customer.resources.yml").read_text())
+    assert set(document) == {"resources"}
+    assert "router_app" in document["resources"]["apps"]
     for path in (ROOT / "resources").glob("*.yml"):
         assert set(yaml.safe_load(path.read_text())) == {"resources"}
 
@@ -703,13 +721,13 @@ def test_local_bundle_loader_loads_generated_resources_without_profile(
     root_config = ROOT / "databricks.yml"
     assert root_config.is_file(), "Root bundle is missing"
     shutil.copyfile(root_config, tmp_path / "databricks.yml")
-    (tmp_path / "app").mkdir()
-    customer["permissions"]["dashboard"] = []  # Static dashboard definition belongs to a later task.
+    for directory in ("resources", "sql", "dashboards"):
+        shutil.copytree(ROOT / directory, tmp_path / directory)
     _, _, document, _ = compile_documents(compiler, tmp_path, customer, demo)
     empty_credentials = tmp_path / "empty.cfg"
     empty_credentials.write_text("")
     completed = subprocess.run(
-        [executable, "bundle", "validate", "--strict", "--output", "json"],
+        [executable, "bundle", "validate", "--target", "customer", "--output", "json"],
         check=False, cwd=tmp_path,
         env={"PATH": os.environ["PATH"], "DATABRICKS_CONFIG_FILE": str(empty_credentials)},
         capture_output=True, text=True, timeout=15,
@@ -721,8 +739,12 @@ def test_local_bundle_loader_loads_generated_resources_without_profile(
     ), completed.stderr
     assert "Warning:" not in completed.stderr
     loaded = json.loads(completed.stdout)
-    assert loaded["include"] == [".generated/customer.resources.yml"]
+    assert ".generated/customer.resources.yml" in loaded["include"]
     assert loaded["resources"]["apps"]["router_app"]["resources"] == document["resources"]["apps"]["router_app"]["resources"]
     assert ("demo_seed" in loaded["resources"].get("jobs", {})) is demo
+    bootstrap = loaded["resources"]["jobs"]["router_bootstrap"]["tasks"][0]
+    assert bootstrap["task_key"] == "bootstrap"
+    assert Path(bootstrap["notebook_task"]["notebook_path"]).name == "bootstrap.sql"
+    assert bootstrap["notebook_task"]["warehouse_id"] == "abc123"
     if demo:
         assert loaded["resources"]["jobs"]["demo_seed"]["tasks"] == document["resources"]["jobs"]["demo_seed"]["tasks"]

@@ -17,6 +17,7 @@ from setup.models import RouterPackageConfig, _UniqueKeySafeLoader, load_custome
 
 _TEMPLATE_DIR = Path(__file__).with_name("templates")
 _DEMO_RESOURCE_DIR = Path(__file__).resolve().parents[1] / "demo/resources"
+_STATIC_RESOURCE_DIR = Path(__file__).resolve().parents[1] / "resources"
 _APP_SOURCE_DIR = Path(__file__).resolve().parents[1] / "app"
 _APP_MODULES = (
     "__init__.py", "agent.py", "app.py", "config.py", "definitions.py",
@@ -138,7 +139,21 @@ def _load_demo_resources(output_dir: Path) -> dict:
     return resources
 
 
-def _resource_document(runtime: dict, demo_resources: dict) -> dict:
+def _load_static_resources(output_dir: Path) -> dict:
+    """Flatten static source definitions; DAB rejects duplicate include keys."""
+    resources = {}
+    for filename in ("router_app.app.yml", "bootstrap.job.yml", "router_dashboard.dashboard.yml"):
+        path = _STATIC_RESOURCE_DIR / filename
+        try:
+            document = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader)
+            definitions = _validate_resource_document(document)
+            _merge_resources(resources, _rebase_demo_paths(definitions, path.parent, output_dir))
+        except (ValueError, yaml.YAMLError, UnicodeError):
+            raise ValueError("Static router resource definitions failed validation") from None
+    return resources
+
+
+def _resource_document(runtime: dict, demo_resources: dict, output_dir: Path) -> dict:
     workspace = runtime["workspace"]
     definitions = runtime["definitions"]
     bindings = [
@@ -168,6 +183,13 @@ def _resource_document(runtime: dict, demo_resources: dict) -> dict:
                 "scope": definitions["secret_scope"],
                 "key": definitions["secret_key"],
                 "permission": "READ",
+            },
+        },
+        {
+            "name": "mlflow_experiment",
+            "experiment": {
+                "experiment_id": "${resources.experiments.router_experiment.id}",
+                "permission": "CAN_EDIT",
             },
         },
     ]
@@ -203,17 +225,60 @@ def _resource_document(runtime: dict, demo_resources: dict) -> dict:
             {**principal, "level": "CAN_USE"}
             for principal in runtime["permissions"]["app"]
         ]
-    resources = {"apps": {"router_app": app}}
+    # Customer settings are compiled once; bundle variables are never a second
+    # source of truth for the runtime's catalog/schema/warehouse/experiment.
+    dashboard = {
+        "dataset_catalog": workspace["catalog"],
+        "dataset_schema": workspace["router_schema"],
+        "warehouse_id": workspace["warehouse_id"],
+    }
+    resources = _load_static_resources(output_dir)
+    bootstrap_job = resources["jobs"]["router_bootstrap"]
+    tasks = bootstrap_job["tasks"]
+    tasks[0]["notebook_task"].update({
+        "warehouse_id": workspace["warehouse_id"],
+        "base_parameters": {"catalog": workspace["catalog"], "schema": workspace["router_schema"]},
+    })
+    schemas = sorted({workspace["router_schema"], *(
+        function["full_name"].split(".")[1] for function in runtime["uc_functions"]
+    )})
+    grants = [
+        (f"app_access_{index}", schema,
+         "${resources.apps.router_app.service_principal_client_id}", "schema_access.sql")
+        for index, schema in enumerate(schemas)
+    ]
+    grants.extend(
+        (f"dashboard_access_{index}", workspace["router_schema"],
+         next(iter(principal.values())), "dashboard_access.sql")
+        for index, principal in enumerate(runtime["permissions"]["dashboard"])
+    )
+    for task_key, schema, principal, filename in grants:
+        tasks.append({
+            "task_key": task_key,
+            "depends_on": [{"task_key": "bootstrap"}],
+            "notebook_task": {
+                "notebook_path": Path(os.path.relpath(
+                    Path(__file__).resolve().parents[1] / "sql" / filename,
+                    output_dir,
+                )).as_posix(),
+                "source": "WORKSPACE",
+                "warehouse_id": workspace["warehouse_id"],
+                "base_parameters": {
+                    "catalog": workspace["catalog"], "schema": schema, "principal": principal,
+                },
+            },
+        })
+    resources["apps"]["router_app"].update(app)
+    resources["dashboards"]["router_dashboard"].update(dashboard)
+    dashboard = resources["dashboards"]["router_dashboard"]
+    resources["experiments"] = {
+        "router_experiment": {"name": workspace["mlflow_experiment"]},
+    }
     if runtime["permissions"]["dashboard"]:
-        # The dashboard definition is supplied by the static bundle resources.
-        resources["dashboards"] = {
-            "router_dashboard": {
-                "permissions": [
-                    {**principal, "level": "CAN_READ"}
-                    for principal in runtime["permissions"]["dashboard"]
-                ]
-            }
-        }
+        dashboard["permissions"] = [
+            {**principal, "level": "CAN_READ"}
+            for principal in runtime["permissions"]["dashboard"]
+        ]
     _merge_resources(resources, demo_resources)
     return {"resources": resources}
 
@@ -345,7 +410,7 @@ def compile_config(config_path: Path, output_dir: Path, demo: bool) -> CompileRe
     output = _output_destination(config_path, output_dir)
     runtime = _canonical_runtime(load_customer_config(config_path))
     demo_resources = _load_demo_resources(output) if demo else {}
-    resources = _resource_document(runtime, demo_resources)
+    resources = _resource_document(runtime, demo_resources, output)
     summary = _resource_summary(runtime, demo, demo_resources)
     environment = Environment(
         loader=FileSystemLoader(_TEMPLATE_DIR),

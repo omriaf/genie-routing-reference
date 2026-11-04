@@ -1,0 +1,11 @@
+resources:
+  jobs:
+    router_bootstrap:
+      name: ${bundle.name}-${bundle.target}-bootstrap
+      description: Rerunnable router DDL and explicit traversal/read grants
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: bootstrap
+          notebook_task:
+            notebook_path: ../sql/bootstrap.sql
+            source: WORKSPACE

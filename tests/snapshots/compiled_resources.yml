@@ -1,6 +1,8 @@
 resources:
   apps:
     router_app:
+      description: Customer-configured analytics router with referenced Genie spaces
+        and functions
       name: acme-analytics-router
       permissions:
       - group_name: analytics-users
@@ -35,6 +37,10 @@ resources:
           permission: CAN_RUN
           space_id: 01abc000000000000000000000000002
         name: genie_support
+      - experiment:
+          experiment_id: ${resources.experiments.router_experiment.id}
+          permission: CAN_EDIT
+        name: mlflow_experiment
       - name: sql_warehouse
         sql_warehouse:
           id: abc123
@@ -47,6 +53,62 @@ resources:
       source_code_path: app_source
   dashboards:
     router_dashboard:
+      dataset_catalog: acme_catalog
+      dataset_schema: analytics_router
+      display_name: ${bundle.name}-${bundle.target}-performance
+      embed_credentials: false
+      file_path: ../dashboards/router_performance.lvdash.json
       permissions:
       - level: CAN_READ
         user_name: analyst@example.com
+      warehouse_id: abc123
+  experiments:
+    router_experiment:
+      name: /Shared/acme-analytics-router
+  jobs:
+    router_bootstrap:
+      description: Rerunnable router DDL and explicit traversal/read grants
+      max_concurrent_runs: 1
+      name: ${bundle.name}-${bundle.target}-bootstrap
+      tasks:
+      - notebook_task:
+          base_parameters:
+            catalog: acme_catalog
+            schema: analytics_router
+          notebook_path: ../sql/bootstrap.sql
+          source: WORKSPACE
+          warehouse_id: abc123
+        task_key: bootstrap
+      - depends_on:
+        - task_key: bootstrap
+        notebook_task:
+          base_parameters:
+            catalog: acme_catalog
+            principal: ${resources.apps.router_app.service_principal_client_id}
+            schema: analytics_router
+          notebook_path: ../sql/schema_access.sql
+          source: WORKSPACE
+          warehouse_id: abc123
+        task_key: app_access_0
+      - depends_on:
+        - task_key: bootstrap
+        notebook_task:
+          base_parameters:
+            catalog: acme_catalog
+            principal: ${resources.apps.router_app.service_principal_client_id}
+            schema: metrics
+          notebook_path: ../sql/schema_access.sql
+          source: WORKSPACE
+          warehouse_id: abc123
+        task_key: app_access_1
+      - depends_on:
+        - task_key: bootstrap
+        notebook_task:
+          base_parameters:
+            catalog: acme_catalog
+            principal: analyst@example.com
+            schema: analytics_router
+          notebook_path: ../sql/dashboard_access.sql
+          source: WORKSPACE
+          warehouse_id: abc123
+        task_key: dashboard_access_0
