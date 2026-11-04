@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genie-routing-reference"
+version = "0.1.0"
+description = "Customer-configured analytics routing for Databricks"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2,<3",
+    "PyYAML>=6,<7",
+    "fastapi>=0.115,<1",
+    "mcp>=1,<2",
+    "databricks-sdk>=0.40,<1",
+    "mlflow>=3,<4",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.urls]
+Repository = "https://github.com/omriaf/genie-routing-reference"
+
+[tool.setuptools.packages.find]
+include = ["setup", "setup.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

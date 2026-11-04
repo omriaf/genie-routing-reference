@@ -1,0 +1,58 @@
+# Copy to customer_config/customer.yml (ignored by Git) and replace placeholders.
+# Agent, warehouse, endpoint, function, and secret references identify existing resources.
+customer:
+  name: acme
+  app_name: acme-analytics-router
+
+workspace:
+  catalog: acme_catalog
+  router_schema: analytics_router
+  warehouse_id: abc123
+  classifier_endpoint: databricks-claude-sonnet-4-5
+  mlflow_experiment: /Shared/acme-analytics-router
+
+definitions:
+  repository_url: https://github.com/acme/business-definitions.git
+  branch: main
+  markdown_path: definitions
+  secret_scope: analytics-router
+  secret_key: github-token
+  poll_seconds: 90
+
+routing:
+  confidence_threshold: 0.75
+  overlap_threshold: 0.70
+  prefer_certified_functions: true
+
+genie_agents:
+  - name: sales
+    description: Sales pipeline and revenue analytics
+    # Synthetic 32-character hex placeholder beginning 01abc; replace with an existing ID.
+    space_id: "01abc000000000000000000000000001"
+    routing_guidance: Route sales, pipeline, and revenue questions here
+  - name: support
+    description: Customer support analytics
+    space_id: "01abc000000000000000000000000002"
+    routing_guidance: Route support and resolution questions here
+
+uc_functions:
+  - name: monthly_revenue
+    full_name: acme_catalog.metrics.monthly_revenue
+    domain: sales
+    description: Certified monthly revenue
+    aliases:
+      - monthly sales
+      - revenue by month
+  - name: resolution_time
+    full_name: acme_catalog.metrics.resolution_time
+    domain: support
+    description: Certified average resolution time
+    aliases:
+      - time to resolution
+
+# Optional access for existing Databricks groups or users. Omit for no extra grants.
+permissions:
+  app:
+    - group_name: analytics-users
+  dashboard:
+    - user_name: analyst@example.com
