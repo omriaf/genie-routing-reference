@@ -128,5 +128,19 @@ not configuration fields, and the package never auto-selects a profile.
 Do not modify application, setup, or resource code for customer settings.
 Generated artifacts belong under the ignored `.generated/` directory.
 
-This task defines the contract only. Compiler, deployment resources, live
-permission checks, and runtime connectivity are implemented in later tasks.
+Compile with `python -m setup.compile_config --config customer_config/customer.yml
+--output .generated`. The root `databricks.yml` directly includes
+`.generated/customer.resources.yml`. Only the root bundle file may contain an
+`include` section; generated and static resource files contain a `resources`
+mapping instead.
+
+Demo mode is opt-in with `--demo`. It reads packaged definitions from
+`demo/resources/*.yml` and `*.yaml`, validates their resource-only shape, and
+merges them directly into the same generated document. Demo files cannot
+contain nested includes or duplicate/override customer resource declarations.
+Local notebook, Python, SQL-file, library, dbt, app, and dashboard source paths
+are rebased from each definition file to the generated document; absolute,
+remote, substitution-based, and Git source paths are preserved. Production
+compilation does not read demo definitions. Demo mode fails without replacing
+existing output if definitions are missing or invalid; demo assets and the
+remaining deployment resources are supplied by later tasks.

@@ -37,6 +37,25 @@ def customer():
     )
 
 
+@pytest.fixture
+def demo_resources(compiler, tmp_path, monkeypatch):
+    directory = tmp_path / "demo/resources"
+    directory.mkdir(parents=True)
+    generators = directory.parent / "generators"
+    generators.mkdir()
+    (generators / "seed.py").write_text("# Databricks notebook source\nprint('synthetic data')\n")
+    (directory / "demo.job.yml").write_text(yaml.safe_dump({
+        "resources": {"jobs": {"demo_seed": {
+            "name": "synthetic-seed",
+            "tasks": [{"task_key": "seed", "notebook_task": {
+                "notebook_path": "../generators/seed.py", "source": "WORKSPACE"
+            }}],
+        }}}
+    }))
+    monkeypatch.setattr(compiler, "_DEMO_RESOURCE_DIR", directory, raising=False)
+    return directory
+
+
 def write_config(directory, data):
     path = directory / "customer.yml"
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
@@ -179,15 +198,141 @@ def test_quoted_multiline_and_template_text_round_trip(compiler, tmp_path, custo
     assert runtime["uc_functions"][0]["aliases"] == ["001", text, "false"]
 
 
-def test_demo_include_is_opt_in_and_removed_on_recompile(compiler, tmp_path, customer):
+def test_demo_resources_are_opt_in_and_removed_on_recompile(compiler, tmp_path, customer, demo_resources):
     path = write_config(tmp_path, customer)
     output = tmp_path / ".generated"
     compiler.compile_config(path, output, True)
-    assert yaml.safe_load((output / "customer.resources.yml").read_text())["include"] == ["../demo/resources/*.yml"]
-    assert json.loads((output / "summary.json").read_text())["demo"] is True
+    document = yaml.safe_load((output / "customer.resources.yml").read_text())
+    assert set(document) == {"resources"}
+    assert document["resources"]["jobs"] == {"demo_seed": {
+        "name": "synthetic-seed",
+        "tasks": [{"task_key": "seed", "notebook_task": {
+            "notebook_path": "../demo/generators/seed.py", "source": "WORKSPACE"
+        }}],
+    }}
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["demo"] is True
+    assert summary["demo_resource_counts"] == {"jobs": 1}
     compiler.compile_config(path, output, False)
-    assert "include" not in yaml.safe_load((output / "customer.resources.yml").read_text())
+    document = yaml.safe_load((output / "customer.resources.yml").read_text())
+    assert set(document) == {"resources"}
+    assert "jobs" not in document["resources"]
     assert json.loads((output / "summary.json").read_text())["demo"] is False
+    assert (output / "customer.resources.yml").read_bytes() == (SNAPSHOTS / "compiled_resources.yml").read_bytes()
+
+
+@pytest.mark.parametrize("demo", [False, True])
+def test_generated_resource_document_has_no_nested_include(compiler, tmp_path, customer, demo_resources, demo):
+    _, _, document, _ = compile_documents(compiler, tmp_path, customer, demo)
+
+    def check_shape(value):
+        if isinstance(value, dict):
+            assert "include" not in value
+            for child in value.values():
+                check_shape(child)
+        elif isinstance(value, list):
+            for child in value:
+                check_shape(child)
+
+    assert set(document) == {"resources"}
+    assert set(document["resources"]) == ({"apps", "dashboards", "jobs"} if demo else {"apps", "dashboards"})
+    for declarations in document["resources"].values():
+        assert isinstance(declarations, dict)
+        assert all(isinstance(body, dict) for body in declarations.values())
+    check_shape(document)
+
+
+def test_demo_merge_is_deterministic_across_file_and_mapping_order(compiler, tmp_path, customer, demo_resources):
+    path = write_config(tmp_path, customer)
+    first = tmp_path / "first"
+    other = {"resources": {"jobs": {"demo_other": {"name": "synthetic-other", "tasks": []}}}}
+    (demo_resources / "a.yml").write_text(yaml.safe_dump(other))
+    compiler.compile_config(path, first, True)
+    (demo_resources / "a.yml").unlink()
+    other["resources"]["jobs"]["demo_other"] = {"tasks": [], "name": "synthetic-other"}
+    (demo_resources / "z.yaml").write_text(yaml.safe_dump(other, sort_keys=False))
+    second = tmp_path / "second"
+    compiler.compile_config(path, second, True)
+
+    assert files(first) == files(second)
+    assert json.loads(files(first)["summary.json"])["demo_resource_counts"] == {"jobs": 2}
+
+
+@pytest.mark.parametrize("bad_yaml", [
+    "resources: [",
+    "include: [child.yml]\nresources: {}\n",
+    "resources: []\n",
+    "resources:\n  jobs: []\n",
+    "resources:\n  jobs:\n    broken: []\n",
+    "resources:\n  jobs:\n    broken:\n      include: [child.yml]\n",
+    "resources:\n  jobs:\n    duplicate: {name: first}\n    duplicate: {name: second}\n",
+    "resources:\n  apps:\n    router_app: {name: unexpected-app}\n",
+])
+def test_invalid_demo_resources_preserve_output_and_are_ignored_in_production(
+    compiler, tmp_path, customer, demo_resources, bad_yaml
+):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    compiler.compile_config(path, output, False)
+    before = files(output)
+    (demo_resources / "demo.job.yml").write_text(bad_yaml)
+
+    with pytest.raises(ValueError):
+        compiler.compile_config(path, output, True)
+
+    assert files(output) == before
+    assert not list(tmp_path.glob(".generated-*"))
+    compiler.compile_config(path, output, False)
+    assert files(output) == before
+
+
+def test_demo_resource_name_collisions_are_rejected(compiler, tmp_path, customer, demo_resources):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    compiler.compile_config(path, output, False)
+    before = files(output)
+    (demo_resources / "other.yml").write_bytes((demo_resources / "demo.job.yml").read_bytes())
+
+    with pytest.raises(ValueError):
+        compiler.compile_config(path, output, True)
+
+    assert files(output) == before
+
+
+def test_missing_demo_resources_fail_without_replacing_output(compiler, tmp_path, customer, demo_resources):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    compiler.compile_config(path, output, False)
+    before = files(output)
+    (demo_resources / "demo.job.yml").unlink()
+
+    with pytest.raises(ValueError):
+        compiler.compile_config(path, output, True)
+
+    assert files(output) == before
+
+
+def test_demo_paths_preserve_absolute_remote_and_git_sources(compiler, tmp_path, customer, demo_resources):
+    path = write_config(tmp_path, customer)
+    source = yaml.safe_load((demo_resources / "demo.job.yml").read_text())
+    source["resources"]["jobs"]["demo_seed"]["tasks"] = [
+        {"task_key": "local", "spark_python_task": {"python_file": "../generators/seed.py"}},
+        {"task_key": "git", "notebook_task": {"notebook_path": "relative/git/path", "source": "GIT"}},
+        {"task_key": "workspace", "notebook_task": {"notebook_path": "/Shared/seed"}},
+        {"task_key": "remote", "spark_python_task": {"python_file": "s3://sample/seed.py"}},
+        {"task_key": "substitution", "notebook_task": {"notebook_path": "${workspace.file_path}/seed"}},
+    ]
+    (demo_resources / "demo.job.yml").write_text(yaml.safe_dump(source))
+    _, _, document, _ = compile_documents(compiler, tmp_path, customer, True)
+    tasks = document["resources"]["jobs"]["demo_seed"]["tasks"]
+
+    assert tasks == [
+        {"task_key": "local", "spark_python_task": {"python_file": "../demo/generators/seed.py"}},
+        {"task_key": "git", "notebook_task": {"notebook_path": "relative/git/path", "source": "GIT"}},
+        {"task_key": "workspace", "notebook_task": {"notebook_path": "/Shared/seed"}},
+        {"task_key": "remote", "spark_python_task": {"python_file": "s3://sample/seed.py"}},
+        {"task_key": "substitution", "notebook_task": {"notebook_path": "${workspace.file_path}/seed"}},
+    ]
 
 
 @pytest.mark.parametrize("template,broken", [
@@ -217,7 +362,7 @@ def test_render_failure_preserves_entire_existing_output(compiler, tmp_path, cus
     assert not list(tmp_path.glob(".generated-*"))
 
 
-def test_publication_failure_preserves_output_and_cleans_staging(compiler, tmp_path, customer, monkeypatch):
+def test_publication_failure_preserves_output_and_cleans_staging(compiler, tmp_path, customer, monkeypatch, demo_resources):
     path = write_config(tmp_path, customer)
     output = tmp_path / ".generated"
     compiler.compile_config(path, output, False)
@@ -272,7 +417,7 @@ def test_staging_write_failure_preserves_output(compiler, tmp_path, customer, mo
     assert not list(tmp_path.glob(".generated-*"))
 
 
-def test_success_replaces_directory_instead_of_overwriting_files(compiler, tmp_path, customer):
+def test_success_replaces_directory_instead_of_overwriting_files(compiler, tmp_path, customer, demo_resources):
     path = write_config(tmp_path, customer)
     output = tmp_path / ".generated"
     compiler.compile_config(path, output, True)
@@ -335,12 +480,13 @@ def test_invalid_config_preserves_existing_output(compiler, tmp_path, customer):
     assert files(output) == before
 
 
-def test_cli_prints_generated_paths_and_redacted_summary(tmp_path, customer):
+def test_cli_prints_generated_paths_and_redacted_summary(tmp_path, customer, demo_resources):
+    shutil.copytree(ROOT / "setup", tmp_path / "setup", ignore=shutil.ignore_patterns("__pycache__"))
     path = write_config(tmp_path, customer)
     output = tmp_path / ".generated"
     command = [sys.executable, "-m", "setup.compile_config", "--config", str(path), "--output", str(output)]
     env = dict(os.environ, GITHUB_TOKEN="ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE")
-    completed = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True)
+    completed = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True)
 
     assert completed.returncode == 0, completed.stderr
     for name in ("customer.resources.yml", "runtime_config.json", "summary.json"):
@@ -348,9 +494,11 @@ def test_cli_prints_generated_paths_and_redacted_summary(tmp_path, customer):
     for forbidden in ("ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE", "01abc", "acme_catalog", "github.com", "analytics-users", "github-token"):
         assert forbidden not in completed.stdout + completed.stderr
     assert json.loads((output / "summary.json").read_text())["demo"] is False
-    demo = subprocess.run(command + ["--demo"], cwd=ROOT, capture_output=True, text=True)
+    demo = subprocess.run(command + ["--demo"], cwd=tmp_path, env=env, capture_output=True, text=True)
     assert demo.returncode == 0, demo.stderr
     assert json.loads((output / "summary.json").read_text())["demo"] is True
+    assert "demo_seed" in yaml.safe_load((output / "customer.resources.yml").read_text())["resources"]["jobs"]
+    assert "ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE" not in demo.stdout + demo.stderr
 
 
 @pytest.mark.parametrize("bad_yaml", [
@@ -384,13 +532,55 @@ def test_cli_rejects_unsupported_options(tmp_path, customer, flag):
     assert not output.exists()
 
 
-def test_generated_include_resolves_from_resource_directory(compiler, tmp_path, customer):
-    resource_dir = tmp_path / "resources"
-    resource_dir.mkdir()
-    include = resource_dir / "generated.include.yml"
-    shutil.copyfile(ROOT / "resources/generated.include.yml", include)
+def test_root_bundle_directly_includes_generated_resource_document(compiler, tmp_path, customer):
+    root_config = ROOT / "databricks.yml"
+    assert root_config.is_file(), "The generated resource document must be included by the root bundle"
+    shutil.copyfile(root_config, tmp_path / "databricks.yml")
     compile_documents(compiler, tmp_path, customer)
-    entries = yaml.safe_load(include.read_text())["include"]
-    assert len(entries) == 1
-    assert (include.parent / entries[0]).resolve() == tmp_path / ".generated/customer.resources.yml"
-    assert (include.parent / entries[0]).is_file()
+    root = yaml.safe_load((tmp_path / "databricks.yml").read_text())
+
+    assert root == {
+        "bundle": {"name": "genie-routing-reference"},
+        "include": [".generated/customer.resources.yml"],
+    }
+    for entry in root["include"]:
+        document = yaml.safe_load((tmp_path / entry).read_text())
+        assert set(document) == {"resources"}
+        assert "router_app" in document["resources"]["apps"]
+    for path in (ROOT / "resources").glob("*.yml"):
+        assert set(yaml.safe_load(path.read_text())) == {"resources"}
+
+
+@pytest.mark.parametrize("demo", [False, True])
+def test_local_bundle_loader_loads_generated_resources_without_profile(
+    compiler, tmp_path, customer, demo_resources, demo
+):
+    executable = shutil.which("databricks")
+    if executable is None:
+        pytest.skip("Databricks CLI unavailable; root/resource contract is tested separately")
+    root_config = ROOT / "databricks.yml"
+    assert root_config.is_file(), "Root bundle is missing"
+    shutil.copyfile(root_config, tmp_path / "databricks.yml")
+    (tmp_path / "app").mkdir()
+    customer["permissions"]["dashboard"] = []  # Static dashboard definition belongs to a later task.
+    _, _, document, _ = compile_documents(compiler, tmp_path, customer, demo)
+    empty_credentials = tmp_path / "empty.cfg"
+    empty_credentials.write_text("")
+    completed = subprocess.run(
+        [executable, "bundle", "validate", "--strict", "--output", "json"],
+        cwd=tmp_path,
+        env={"PATH": os.environ["PATH"], "DATABRICKS_CONFIG_FILE": str(empty_credentials)},
+        capture_output=True, text=True, timeout=15,
+    )
+
+    # The CLI exposes the locally loaded configuration before its auth visitor.
+    assert completed.returncode == 0 or (
+        completed.returncode == 1 and "cannot configure default credentials" in completed.stderr
+    ), completed.stderr
+    assert "Warning:" not in completed.stderr
+    loaded = json.loads(completed.stdout)
+    assert loaded["include"] == [".generated/customer.resources.yml"]
+    assert loaded["resources"]["apps"]["router_app"]["resources"] == document["resources"]["apps"]["router_app"]["resources"]
+    assert ("demo_seed" in loaded["resources"].get("jobs", {})) is demo
+    if demo:
+        assert loaded["resources"]["jobs"]["demo_seed"]["tasks"] == document["resources"]["jobs"]["demo_seed"]["tasks"]

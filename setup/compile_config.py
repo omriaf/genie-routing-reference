@@ -13,10 +13,11 @@ from tempfile import TemporaryDirectory
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateError
 import yaml
 
-from setup.models import RouterPackageConfig, load_customer_config
+from setup.models import RouterPackageConfig, _UniqueKeySafeLoader, load_customer_config
 
 
 _TEMPLATE_DIR = Path(__file__).with_name("templates")
+_DEMO_RESOURCE_DIR = Path(__file__).resolve().parents[1] / "demo/resources"
 _FILENAMES = ("customer.resources.yml", "runtime_config.json", "summary.json")
 
 
@@ -50,7 +51,88 @@ def _canonical_runtime(config: RouterPackageConfig) -> dict:
     return runtime
 
 
-def _resource_document(runtime: dict, demo: bool) -> dict:
+def _validate_resource_document(document: object) -> dict:
+    if not isinstance(document, dict) or set(document) != {"resources"}:
+        raise ValueError("A resource document must contain only a resources mapping")
+    resources = document["resources"]
+    if not isinstance(resources, dict):
+        raise ValueError("Resource groups must be mappings")
+    for kind, declarations in resources.items():
+        if not isinstance(kind, str) or not isinstance(declarations, dict):
+            raise ValueError("Resource groups must be named mappings")
+        for name, body in declarations.items():
+            if not isinstance(name, str) or not isinstance(body, dict):
+                raise ValueError("Resource declarations must be named mappings")
+
+    def reject_include(value):
+        if isinstance(value, dict):
+            if "include" in value:
+                raise ValueError("Includes are supported only in the root bundle file")
+            for child in value.values():
+                reject_include(child)
+        elif isinstance(value, list):
+            for child in value:
+                reject_include(child)
+
+    reject_include(resources)
+    return resources
+
+
+def _rebase_demo_paths(value, source_dir: Path, output_dir: Path, path=(), git_source=False):
+    """Keep local source references valid when flattening demo resource files."""
+    if isinstance(value, list):
+        return [_rebase_demo_paths(item, source_dir, output_dir, path, git_source) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if isinstance(value.get("git_source"), dict):
+        git_source = True
+    if value.get("source") in {"GIT", "WORKSPACE"}:
+        git_source = value["source"] == "GIT"
+    rebased = {}
+    for key, child in value.items():
+        is_path = (
+            (path[-1:] == ("notebook_task",) and key == "notebook_path")
+            or (path[-1:] == ("spark_python_task",) and key == "python_file")
+            or (path[-1:] == ("dbt_task",) and key == "project_directory")
+            or (path[-1:] == ("libraries",) and key in {"whl", "jar", "egg"})
+            or (path[-2:] in {("sql_task", "file"), ("libraries", "notebook"), ("libraries", "file")} and key == "path")
+            or (len(path) == 2 and path[0] == "apps" and key == "source_code_path")
+            or (len(path) == 2 and path[0] == "dashboards" and key == "file_path")
+        )
+        if (
+            is_path and isinstance(child, str) and not git_source
+            and not child.startswith(("/", "${", "~")) and ":" not in child
+        ):
+            child = Path(os.path.relpath((source_dir / child).resolve(), output_dir)).as_posix()
+        rebased[key] = _rebase_demo_paths(child, source_dir, output_dir, (*path, key), git_source)
+    return rebased
+
+
+def _merge_resources(destination: dict, source: dict) -> None:
+    for kind, declarations in sorted(source.items()):
+        target = destination.setdefault(kind, {})
+        for name, body in sorted(declarations.items()):
+            if name in target:
+                raise ValueError("Duplicate resource declarations are not allowed")
+            target[name] = body
+
+
+def _load_demo_resources(output_dir: Path) -> dict:
+    paths = sorted((*_DEMO_RESOURCE_DIR.glob("*.yml"), *_DEMO_RESOURCE_DIR.glob("*.yaml")))
+    resources = {}
+    for path in paths:
+        try:
+            document = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader)
+            definitions = _validate_resource_document(document)
+        except (ValueError, yaml.YAMLError, UnicodeError):
+            raise ValueError("Demo resource definitions failed validation") from None
+        _merge_resources(resources, _rebase_demo_paths(definitions, path.parent, output_dir))
+    if not any(resources.values()):
+        raise ValueError("Demo mode requires definitions under demo/resources")
+    return resources
+
+
+def _resource_document(runtime: dict, demo_resources: dict) -> dict:
     workspace = runtime["workspace"]
     definitions = runtime["definitions"]
     bindings = [
@@ -126,15 +208,13 @@ def _resource_document(runtime: dict, demo: bool) -> dict:
                 ]
             }
         }
-    document = {"resources": resources}
-    if demo:
-        document["include"] = ["../demo/resources/*.yml"]
-    return document
+    _merge_resources(resources, demo_resources)
+    return {"resources": resources}
 
 
-def _resource_summary(runtime: dict, demo: bool) -> dict:
+def _resource_summary(runtime: dict, demo: bool, demo_resources: dict) -> dict:
     # Only counts and fixed filenames leave the generated configuration boundary.
-    return {
+    summary = {
         "demo": demo,
         "files": list(_FILENAMES),
         "permissions": {
@@ -150,15 +230,22 @@ def _resource_summary(runtime: dict, demo: bool) -> dict:
             "uc_functions": len(runtime["uc_functions"]),
         },
     }
+    if demo:
+        summary["demo_resource_counts"] = {
+            kind: len(declarations) for kind, declarations in sorted(demo_resources.items())
+        }
+    return summary
 
 
 def _validate_artifacts(staging: Path, runtime: dict, resources: dict, summary: dict) -> None:
     try:
         loaded_runtime = json.loads((staging / "runtime_config.json").read_text(encoding="utf-8"))
         RouterPackageConfig.model_validate(loaded_runtime)
-        loaded_resources = yaml.safe_load(
-            (staging / "customer.resources.yml").read_text(encoding="utf-8")
+        loaded_resources = yaml.load(
+            (staging / "customer.resources.yml").read_text(encoding="utf-8"),
+            Loader=_UniqueKeySafeLoader,
         )
+        _validate_resource_document(loaded_resources)
         loaded_summary = json.loads((staging / "summary.json").read_text(encoding="utf-8"))
         if (loaded_runtime, loaded_resources, loaded_summary) != (runtime, resources, summary):
             raise ValueError("Rendered artifacts differ from the validated configuration")
@@ -206,8 +293,9 @@ def compile_config(config_path: Path, output_dir: Path, demo: bool) -> CompileRe
     """
     output = _output_destination(config_path, output_dir)
     runtime = _canonical_runtime(load_customer_config(config_path))
-    resources = _resource_document(runtime, demo)
-    summary = _resource_summary(runtime, demo)
+    demo_resources = _load_demo_resources(output) if demo else {}
+    resources = _resource_document(runtime, demo_resources)
+    summary = _resource_summary(runtime, demo, demo_resources)
     environment = Environment(
         loader=FileSystemLoader(_TEMPLATE_DIR),
         undefined=StrictUndefined,
