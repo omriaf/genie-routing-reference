@@ -112,3 +112,6 @@ resources:
           source: WORKSPACE
           warehouse_id: abc123
         task_key: dashboard_access_0
+sync:
+  exclude:
+  - ../demo/**

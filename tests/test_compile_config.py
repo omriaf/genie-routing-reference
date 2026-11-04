@@ -80,6 +80,11 @@ def portable_resources(path):
     assert source == ROOT / "dashboards/router_performance.lvdash.json"
     assert source.is_file()
     dashboard["file_path"] = "../dashboards/router_performance.lvdash.json"
+    for patterns in document["sync"].values():
+        for index, pattern in enumerate(patterns):
+            assert Path(pattern).name == "**"
+            assert (path.parent / Path(pattern).parent).resolve().name == "demo"
+            patterns[index] = "../demo/**"
     return document
 
 
@@ -355,7 +360,8 @@ def test_demo_resources_are_opt_in_and_removed_on_recompile(compiler, tmp_path, 
     output = tmp_path / ".generated"
     compiler.compile_config(path, output, True)
     document = yaml.safe_load((output / "customer.resources.yml").read_text())
-    assert set(document) == {"resources"}
+    assert set(document) == {"resources", "sync"}
+    assert document["sync"] == {"include": ["../demo/**"]}
     assert document["resources"]["jobs"]["demo_seed"] == {
         "name": "synthetic-seed",
         "tasks": [{"task_key": "seed", "notebook_task": {
@@ -367,7 +373,8 @@ def test_demo_resources_are_opt_in_and_removed_on_recompile(compiler, tmp_path, 
     assert summary["demo_resource_counts"] == {"jobs": 1}
     compiler.compile_config(path, output, False)
     document = yaml.safe_load((output / "customer.resources.yml").read_text())
-    assert set(document) == {"resources"}
+    assert set(document) == {"resources", "sync"}
+    assert document["sync"] == {"exclude": ["../demo/**"]}
     assert set(document["resources"]["jobs"]) == {"router_bootstrap"}
     assert json.loads((output / "summary.json").read_text())["demo"] is False
     assert portable_resources(output / "customer.resources.yml") == yaml.safe_load((SNAPSHOTS / "compiled_resources.yml").read_text())
@@ -386,12 +393,14 @@ def test_generated_resource_document_has_no_nested_include(compiler, tmp_path, c
             for child in value:
                 check_shape(child)
 
-    assert set(document) == {"resources"}
+    assert set(document) == {"resources", "sync"}
+    assert "include" not in document
     assert set(document["resources"]) == {"apps", "dashboards", "jobs", "experiments"}
     for declarations in document["resources"].values():
         assert isinstance(declarations, dict)
         assert all(isinstance(body, dict) for body in declarations.values())
-    check_shape(document)
+    # sync.include is a DAB path list, not a recursive bundle-file include.
+    check_shape(document["resources"])
 
 
 def test_demo_merge_is_deterministic_across_file_and_mapping_order(compiler, tmp_path, customer, demo_resources):
@@ -705,7 +714,7 @@ def test_root_bundle_directly_includes_generated_resource_document(compiler, tmp
     assert root["bundle"]["name"] == "genie-routing-reference"
     assert ".generated/customer.resources.yml" in root["include"]
     document = yaml.safe_load((tmp_path / ".generated/customer.resources.yml").read_text())
-    assert set(document) == {"resources"}
+    assert set(document) == {"resources", "sync"}
     assert "router_app" in document["resources"]["apps"]
     for path in (ROOT / "resources").glob("*.yml"):
         assert set(yaml.safe_load(path.read_text())) == {"resources"}

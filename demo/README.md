@@ -125,6 +125,10 @@ python -m setup.bundle run --resource demo_seed --target customer \
 ```
 
 Only compiler `--demo` includes `demo_seed` in the generated resource document.
+The generated fragment also controls DAB synchronization: production excludes
+every `demo/` file from upload, while demo mode includes the demo source tree,
+including the notebook's Python helper and SQL file. Recompiling changes both
+the resource overlay and upload set together.
 Omitting it (including on preflight) emits production resources only. Recompile
 without the flag to remove the overlay from generated output. Existing sample
 data and external agents remain until the installer removes them. Ordinary

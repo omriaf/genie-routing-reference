@@ -58,9 +58,17 @@ def _canonical_runtime(config: RouterPackageConfig) -> dict:
     return runtime
 
 
-def _validate_resource_document(document: object) -> dict:
-    if not isinstance(document, dict) or set(document) != {"resources"}:
-        raise ValueError("A resource document must contain only a resources mapping")
+def _validate_resource_document(document: object, *, generated: bool = False) -> dict:
+    allowed = {"resources", "sync"} if generated else {"resources"}
+    if not isinstance(document, dict) or set(document) != allowed:
+        raise ValueError("Resource document has invalid top-level fields")
+    if generated:
+        sync = document["sync"]
+        if (not isinstance(sync, dict) or not sync or not sync.keys() <= {"include", "exclude"}
+                or any(not isinstance(patterns, list) or any(
+                    not isinstance(pattern, str) or not pattern.strip() for pattern in patterns
+                ) for patterns in sync.values())):
+            raise ValueError("Generated sync configuration must contain path pattern lists")
     resources = document["resources"]
     if not isinstance(resources, dict):
         raise ValueError("Resource groups must be mappings")  # noqa: TRY004 - compiler validation contract
@@ -280,7 +288,14 @@ def _resource_document(runtime: dict, demo_resources: dict, output_dir: Path) ->
             for principal in runtime["permissions"]["dashboard"]
         ]
     _merge_resources(resources, demo_resources)
-    return {"resources": resources}
+    # Includes add to DAB's default sync set; only exclusion prevents tracked
+    # demo files from uploading in production. DAB rebases patterns relative to
+    # the fragment declaring them, just like the local resource source paths.
+    demo_pattern = (Path(os.path.relpath(_DEMO_RESOURCE_DIR.parent, output_dir)) / "**").as_posix()
+    return {
+        "resources": resources,
+        "sync": {"include" if demo_resources else "exclude": [demo_pattern]},
+    }
 
 
 def _resource_summary(runtime: dict, demo: bool, demo_resources: dict) -> dict:
@@ -342,7 +357,7 @@ def _validate_artifacts(
             (staging / "customer.resources.yml").read_text(encoding="utf-8"),
             Loader=_UniqueKeySafeLoader,
         )
-        _validate_resource_document(loaded_resources)
+        _validate_resource_document(loaded_resources, generated=True)
         loaded_summary = json.loads((staging / "summary.json").read_text(encoding="utf-8"))
         if (loaded_runtime, loaded_resources, loaded_summary) != (runtime, resources, summary):
             raise ValueError("Rendered artifacts differ from the validated configuration")

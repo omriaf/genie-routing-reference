@@ -9,8 +9,11 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 import yaml
@@ -200,6 +203,89 @@ def test_real_bundle_loader_accepts_shipped_demo_without_credentials(tmp_path, d
     resources = json.loads(result.stdout)["resources"]
     assert "demo_seed" in resources["jobs"]
     assert resources["dashboards"]["router_dashboard"]["dataset_catalog"] == "alternate_catalog"
+
+
+def test_compile_mode_controls_actual_bundle_upload_set(tmp_path, demo_config, monkeypatch):
+    """Catch files uploaded by default even when no resource references them."""
+    executable = shutil.which("databricks")
+    if executable is None:
+        pytest.skip("Databricks CLI unavailable")
+    compiler = importlib.import_module("setup.compile_config")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    for name in ("databricks.yml", ".gitignore", "resources", "sql", "dashboards", "demo", "app", "setup"):
+        source = ROOT / name
+        if source.is_dir():
+            shutil.copytree(source, checkout / name, ignore=shutil.ignore_patterns("__pycache__"))
+        else:
+            shutil.copyfile(source, checkout / name)
+    for name in ("customer_config", "tests", ".venv"):
+        directory = checkout / name
+        directory.mkdir()
+        (directory / "not-for-upload.txt").write_text("Synthetic exclusion marker")
+    subprocess.run(["git", "init", "--quiet"], cwd=checkout, check=True, capture_output=True)
+    monkeypatch.setattr(compiler, "__file__", str(checkout / "setup/compile_config.py"))
+    for attribute, path in [("_STATIC_RESOURCE_DIR", "resources"), ("_DEMO_RESOURCE_DIR", "demo/resources"), ("_APP_SOURCE_DIR", "app")]:
+        monkeypatch.setattr(compiler, attribute, checkout / path)
+    requests = []
+
+    class WorkspaceMock(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            path = urlsplit(self.path).path
+            if path == "/.well-known/databricks-config":
+                body = {"oidc_endpoint": f"http://127.0.0.1:{self.server.server_port}/oidc"}
+            elif path == "/api/2.0/preview/scim/v2/Me":
+                body = {"id": "123", "userName": "sync-test@example.com", "displayName": "Sync Test", "active": True, "groups": []}
+            elif self.path.startswith("/api/2.0/workspace/get-status"):
+                body = {"object_type": "DIRECTORY", "path": "/Workspace/Shared/sync-test"}
+            elif self.path.startswith("/api/2.0/workspace/list"):
+                body = {"objects": []}
+            else:
+                self.send_error(404, "Unexpected mock request")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), WorkspaceMock)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    credentials = tmp_path / "mock.cfg"
+    credentials.write_text(f"[sync-test]\nhost = http://127.0.0.1:{server.server_port}\ntoken = synthetic-sync-test\nauth_type = pat\n")
+    try:
+        for demo in (False, True, False):
+            compile_config(demo_config[0], checkout / ".generated", demo)
+            result = subprocess.run([
+                executable, "bundle", "sync", "--dry-run", "--full", "--target", "customer",
+                "--profile", "sync-test", "--output", "json",
+            ], check=False, cwd=checkout,
+                env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "DATABRICKS_CONFIG_FILE": str(credentials)},
+                capture_output=True, text=True, timeout=15)
+            assert result.returncode == 0, (result.stdout, result.stderr, requests)
+            assert "Warning:" not in result.stderr, result.stderr
+            events = [json.loads(line) for line in result.stdout.splitlines()]
+            completed = [event for event in events if event["type"] == "complete"]
+            assert len(completed) == 1 and completed[0]["dry_run"] is True
+            uploads = set(completed[0]["put"])
+            assert {".generated/app_source/app.yaml", ".generated/app_source/runtime_config.json", "sql/bootstrap.sql"} <= uploads
+            assert not any(path.startswith(("customer_config/", "tests/", ".venv/")) for path in uploads)
+            if demo:
+                assert {"demo/generators/seed.py", "demo/generators/generate.py", "demo/sql/functions.sql"} <= uploads
+                resources = yaml.safe_load((checkout / ".generated/customer.resources.yml").read_text())["resources"]
+                seed = resources["jobs"]["demo_seed"]["tasks"][0]["notebook_task"]
+                source = (checkout / ".generated" / seed["notebook_path"]).resolve()
+                assert source.is_file() and source.relative_to(checkout).as_posix() in uploads
+            else:
+                assert not any(path.startswith("demo/") for path in uploads), sorted(uploads)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.mark.parametrize("catalog,schema", [("bad.catalog", "safe"), ("safe", "bad;schema"), ("safe", "")])

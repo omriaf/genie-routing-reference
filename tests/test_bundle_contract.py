@@ -55,6 +55,8 @@ def bundle_document(documents):
     result = copy.deepcopy(documents[0][1])
     resources = result.setdefault("resources", {})
     for _, document in documents[1:]:
+        for field, patterns in document.get("sync", {}).items():
+            result.setdefault("sync", {}).setdefault(field, []).extend(copy.deepcopy(patterns))
         for kind, declarations in document["resources"].items():
             target = resources.setdefault(kind, {})
             assert not target.keys() & declarations.keys(), "Duplicate root resource declarations"
@@ -70,7 +72,7 @@ def test_bundle_has_no_implicit_workspace_or_demo(bundle):
     assert ".generated/customer.resources.yml" in root["include"]
     for path, document in documents:
         if path.name != "databricks.yml":
-            assert set(document) == {"resources"}
+            assert set(document) == {"resources", "sync"}
         assert not re.search(r"(?m)^\s*(host|profile):", yaml.safe_dump(document))
     assert not any("demo" in include for include in root["include"])
     assert all("default" not in variable for variable in root.get("variables", {}).values())

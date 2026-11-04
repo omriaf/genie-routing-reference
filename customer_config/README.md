@@ -130,9 +130,9 @@ Generated artifacts belong under the ignored `.generated/` directory.
 
 Compile with `python -m setup.compile_config --config customer_config/customer.yml
 --output .generated`. The root `databricks.yml` directly includes
-`.generated/customer.resources.yml`. Only the root bundle file may contain an
-`include` section; generated and static resource files contain a `resources`
-mapping instead.
+`.generated/customer.resources.yml`. Only the root bundle file may contain a
+bundle-file `include` section. Generated and static resource files contain a
+`resources` mapping, and the generated fragment also declares top-level `sync`.
 
 The compiler also stages the deployable App at `.generated/app_source/` and
 points the generated App resource there. It includes the runtime packages,
@@ -149,5 +149,13 @@ Local notebook, Python, SQL-file, library, dbt, app, and dashboard source paths
 are rebased from each definition file to the generated document; absolute,
 remote, substitution-based, and Git source paths are preserved. Production
 compilation does not read demo definitions. Demo mode fails without replacing
-existing output if definitions are missing or invalid; demo assets and the
-remaining deployment resources are supplied by later tasks.
+existing output if definitions are missing or invalid.
+
+The generated fragment also declares top-level `sync` settings. Production
+compilation excludes the entire `demo/` tree from DAB synchronization and
+upload. With `--demo`, it includes that tree so the demo notebook, its Python
+helper, and SQL definitions are available together. Patterns are relative to
+the generated fragment, and the root bundle's App-source inclusion and other
+exclusions remain in effect. `sync.include` adds files to the default upload
+set; it does not restrict that set. Resource input files remain resource-only,
+and the generated fragment has no bundle-file `include` or nested includes.
