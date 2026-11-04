@@ -1,0 +1,396 @@
+"""Compiler boundary tests use synthetic references and never contact a workspace."""
+
+import copy
+import importlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+import pytest
+import yaml
+
+from setup.models import load_customer_config
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SNAPSHOTS = Path(__file__).with_name("snapshots")
+
+
+@pytest.fixture
+def compiler():
+    # A missing implementation is an explicit red assertion, not a collection error.
+    try:
+        return importlib.import_module("setup.compile_config")
+    except ModuleNotFoundError as error:
+        if error.name == "setup.compile_config":
+            pytest.fail("compile_config is missing")
+        raise
+
+
+@pytest.fixture
+def customer():
+    return yaml.safe_load(
+        (ROOT / "customer_config/customer.example.yml").read_text(encoding="utf-8")
+    )
+
+
+def write_config(directory, data):
+    path = directory / "customer.yml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return path
+
+
+def files(directory):
+    return {path.name: path.read_bytes() for path in sorted(directory.iterdir())}
+
+
+def compile_documents(compiler, tmp_path, customer, demo=False):
+    config = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    result = compiler.compile_config(config, output, demo)
+    return (
+        result,
+        json.loads((output / "runtime_config.json").read_text()),
+        yaml.safe_load((output / "customer.resources.yml").read_text()),
+        json.loads((output / "summary.json").read_text()),
+    )
+
+
+def test_compiled_artifacts_match_reviewed_snapshots(compiler, tmp_path, customer):
+    result, runtime, resources, _ = compile_documents(compiler, tmp_path, customer)
+
+    assert result.runtime_config.read_bytes() == (SNAPSHOTS / "compiled_runtime.json").read_bytes()
+    assert result.resources.read_bytes() == (SNAPSHOTS / "compiled_resources.yml").read_bytes()
+    assert [path.name for path in result.generated_paths] == [
+        "customer.resources.yml", "runtime_config.json", "summary.json"
+    ]
+    assert result.summary.name == "summary.json"
+    assert runtime["routing"]["confidence_threshold"] == 0.75
+    assert resources["resources"]["apps"]["router_app"]["name"] == "acme-analytics-router"
+    assert load_customer_config(result.runtime_config) == load_customer_config(
+        tmp_path / "customer.yml"
+    )
+
+
+def test_permuted_lists_and_mapping_order_produce_identical_bytes(compiler, tmp_path, customer):
+    customer["permissions"] = {
+        "app": [{"user_name": "z@example.com"}, {"group_name": "z-users"}, {"group_name": "a-users"}],
+        "dashboard": [{"user_name": "z@example.com"}, {"user_name": "a@example.com"}],
+    }
+    path = write_config(tmp_path, customer)
+    first = tmp_path / "first"
+    compiler.compile_config(path, first, False)
+    changed = copy.deepcopy(customer)
+    for key in ("genie_agents", "uc_functions"):
+        changed[key].reverse()
+    for function in changed["uc_functions"]:
+        function["aliases"].reverse()
+    for principals in changed["permissions"].values():
+        principals.reverse()
+    changed = dict(reversed(list(changed.items())))
+    path = write_config(tmp_path, changed)
+    second = tmp_path / "second"
+    compiler.compile_config(path, second, False)
+
+    assert files(first) == files(second)
+    runtime = json.loads(files(first)["runtime_config.json"])
+    assert runtime["permissions"]["app"] == [
+        {"group_name": "a-users"}, {"group_name": "z-users"}, {"user_name": "z@example.com"}
+    ]
+    bindings = yaml.safe_load(files(first)["customer.resources.yml"])["resources"]["apps"]["router_app"]["resources"]
+    assert [entry["name"] for entry in bindings] == sorted(entry["name"] for entry in bindings)
+
+
+def test_one_genie_binding_per_agent_and_exact_function_allowlist(compiler, tmp_path, customer):
+    customer["genie_agents"].append({
+        "name": "operations", "description": "Operations", "space_id": "f" * 32,
+        "routing_guidance": "Operational questions",
+    })
+    customer["uc_functions"][0]["full_name"] = "acme_catalog.Certified.MonthlyRevenue"
+    _, runtime, resource, _ = compile_documents(compiler, tmp_path, customer)
+    bindings = resource["resources"]["apps"]["router_app"]["resources"]
+
+    assert {item["name"]: item["genie_space"] for item in bindings if "genie_space" in item} == {
+        "genie_operations": {"name": "operations", "space_id": "f" * 32, "permission": "CAN_RUN"},
+        "genie_sales": {"name": "sales", "space_id": "01abc000000000000000000000000001", "permission": "CAN_RUN"},
+        "genie_support": {"name": "support", "space_id": "01abc000000000000000000000000002", "permission": "CAN_RUN"},
+    }
+    assert {item["name"]: (item["full_name"], item["domain"]) for item in runtime["uc_functions"]} == {
+        "monthly_revenue": ("acme_catalog.Certified.MonthlyRevenue", "sales"),
+        "resolution_time": ("acme_catalog.metrics.resolution_time", "support"),
+    }
+    function_bindings = [item["uc_securable"] for item in bindings
+                         if item.get("uc_securable", {}).get("securable_type") == "FUNCTION"]
+    assert function_bindings == [
+        {"permission": "EXECUTE", "securable_full_name": "acme_catalog.Certified.MonthlyRevenue", "securable_type": "FUNCTION"},
+        {"permission": "EXECUTE", "securable_full_name": "acme_catalog.metrics.resolution_time", "securable_type": "FUNCTION"},
+    ]
+
+
+def test_secret_is_reference_only_and_summary_is_sanitized(compiler, tmp_path, customer, monkeypatch):
+    marker = "ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE"
+    for name in ("GITHUB_TOKEN", "DATABRICKS_TOKEN", "DATABRICKS_HOST", "DATABRICKS_CONFIG_PROFILE"):
+        monkeypatch.setenv(name, marker)
+    customer["genie_agents"][0]["description"] = "Private business description"
+    _, runtime, resource, summary = compile_documents(compiler, tmp_path, customer)
+    bindings = resource["resources"]["apps"]["router_app"]["resources"]
+
+    assert next(item["secret"] for item in bindings if "secret" in item) == {
+        "scope": "analytics-router", "key": "github-token", "permission": "READ"
+    }
+    assert runtime["definitions"]["secret_scope"] == "analytics-router"
+    assert summary == {
+        "demo": False,
+        "files": ["customer.resources.yml", "runtime_config.json", "summary.json"],
+        "permissions": {"app": 1, "dashboard": 1},
+        "resource_counts": {"genie_spaces": 2, "secrets": 1, "serving_endpoints": 1,
+                            "sql_warehouses": 1, "trace_tables": 1, "uc_functions": 2},
+    }
+    for content in files(tmp_path / ".generated").values():
+        assert marker.encode() not in content
+        assert b"DATABRICKS_HOST" not in content
+        assert b"DATABRICKS_CONFIG_PROFILE" not in content
+    assert "Private business description" not in json.dumps(summary)
+    assert "github.com" not in json.dumps(summary)
+
+
+def test_empty_functions_and_permissions_need_no_extra_grants(compiler, tmp_path, customer):
+    customer["uc_functions"] = []
+    customer.pop("permissions")
+    _, runtime, resources, _ = compile_documents(compiler, tmp_path, customer)
+
+    assert runtime["uc_functions"] == []
+    assert runtime["permissions"] == {"app": [], "dashboard": []}
+    assert "permissions" not in resources["resources"]["apps"]["router_app"]
+    assert "dashboards" not in resources["resources"]
+    assert load_customer_config(tmp_path / ".generated/runtime_config.json").uc_functions == []
+
+
+def test_quoted_multiline_and_template_text_round_trip(compiler, tmp_path, customer):
+    text = 'Quoted "text": yes\n{{ dangerous }}\n- false\nUnicode: café'
+    customer["genie_agents"][0]["routing_guidance"] = text
+    customer["uc_functions"][0]["aliases"] = [text, "001", "false"]
+    _, runtime, _, _ = compile_documents(compiler, tmp_path, customer)
+
+    assert runtime["genie_agents"][0]["routing_guidance"] == text
+    assert runtime["uc_functions"][0]["aliases"] == ["001", text, "false"]
+
+
+def test_demo_include_is_opt_in_and_removed_on_recompile(compiler, tmp_path, customer):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    compiler.compile_config(path, output, True)
+    assert yaml.safe_load((output / "customer.resources.yml").read_text())["include"] == ["../demo/resources/*.yml"]
+    assert json.loads((output / "summary.json").read_text())["demo"] is True
+    compiler.compile_config(path, output, False)
+    assert "include" not in yaml.safe_load((output / "customer.resources.yml").read_text())
+    assert json.loads((output / "summary.json").read_text())["demo"] is False
+
+
+@pytest.mark.parametrize("template,broken", [
+    ("runtime-config.json.j2", "{"),
+    ("runtime-config.json.j2", "{}"),
+    ("app-resource.yml.j2", "resources: ["),
+    ("app-resource.yml.j2", "resources: {}"),
+    ("app-resource.yml.j2", "resources:\n  apps:\n    router_app:\n      name: wrong-app\n"),
+    ("runtime-config.json.j2", "{{ missing_template_variable }}"),
+])
+@pytest.mark.parametrize("existing", [False, True])
+def test_render_failure_preserves_entire_existing_output(compiler, tmp_path, customer, monkeypatch, template, broken, existing):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    if existing:
+        compiler.compile_config(path, output, False)
+    before = files(output) if existing else None
+    templates = tmp_path / "templates"
+    shutil.copytree(ROOT / "setup/templates", templates)
+    (templates / template).write_text(broken, encoding="utf-8")
+    monkeypatch.setattr(compiler, "_TEMPLATE_DIR", templates)
+
+    with pytest.raises(ValueError):
+        compiler.compile_config(path, output, False)
+
+    assert (files(output) if output.exists() else None) == before
+    assert not list(tmp_path.glob(".generated-*"))
+
+
+def test_publication_failure_preserves_output_and_cleans_staging(compiler, tmp_path, customer, monkeypatch):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    compiler.compile_config(path, output, False)
+    before = files(output)
+
+    def fail_exchange(source, destination):
+        raise OSError("Simulated filesystem swap failure")
+
+    monkeypatch.setattr(compiler, "_exchange_directories", fail_exchange)
+    with pytest.raises(OSError):
+        compiler.compile_config(path, output, True)
+
+    assert files(output) == before
+    assert not list(tmp_path.glob(".generated-*"))
+
+
+def test_invalid_summary_preserves_output(compiler, tmp_path, customer, monkeypatch):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    compiler.compile_config(path, output, False)
+    before = files(output)
+    write_text = Path.write_text
+
+    def corrupt_summary(self, data, *args, **kwargs):
+        return write_text(self, "{" if self.name == "summary.json" else data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", corrupt_summary)
+    with pytest.raises(ValueError):
+        compiler.compile_config(path, output, False)
+
+    assert files(output) == before
+    assert not list(tmp_path.glob(".generated-*"))
+
+
+def test_staging_write_failure_preserves_output(compiler, tmp_path, customer, monkeypatch):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    compiler.compile_config(path, output, False)
+    before = files(output)
+    write_text = Path.write_text
+
+    def fail_summary_write(self, data, *args, **kwargs):
+        if self.name == "summary.json":
+            raise OSError("Simulated full filesystem")
+        return write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_summary_write)
+    with pytest.raises(OSError):
+        compiler.compile_config(path, output, False)
+
+    assert files(output) == before
+    assert not list(tmp_path.glob(".generated-*"))
+
+
+def test_success_replaces_directory_instead_of_overwriting_files(compiler, tmp_path, customer):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    compiler.compile_config(path, output, True)
+    inode = output.stat().st_ino
+    (output / "obsolete.yml").write_text("obsolete: true\n")
+    with (output / "summary.json").open() as old_summary:
+        compiler.compile_config(path, output, False)
+        assert json.load(old_summary)["demo"] is True
+
+    assert output.stat().st_ino != inode
+    assert sorted(files(output)) == ["customer.resources.yml", "runtime_config.json", "summary.json"]
+    assert not list(tmp_path.glob(".generated-*"))
+
+
+@pytest.mark.parametrize("target", ["symlink", "input_parent", "file"])
+def test_unsafe_output_destination_is_rejected(compiler, tmp_path, customer, target):
+    path = write_config(tmp_path, customer)
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    (protected / "keep").write_text("preserve")
+    output = tmp_path / ".generated"
+    if target == "symlink":
+        output.symlink_to(protected, target_is_directory=True)
+    elif target == "input_parent":
+        output = tmp_path
+    else:
+        output.write_text("preserve")
+
+    with pytest.raises(ValueError):
+        compiler.compile_config(path, output, False)
+
+    assert (protected / "keep").read_text() == "preserve"
+    assert path.exists()
+
+
+def test_config_inside_output_through_symlink_is_preserved(compiler, tmp_path, customer):
+    output = tmp_path / ".generated"
+    output.mkdir()
+    real_config = write_config(output, customer)
+    config_link = tmp_path / "config-link.yml"
+    config_link.symlink_to(real_config)
+    before = files(output)
+
+    with pytest.raises(ValueError):
+        compiler.compile_config(config_link, output, False)
+
+    assert files(output) == before
+
+
+def test_invalid_config_preserves_existing_output(compiler, tmp_path, customer):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    compiler.compile_config(path, output, False)
+    before = files(output)
+    customer["uc_functions"][0]["domain"] = "missing"
+    write_config(tmp_path, customer)
+
+    with pytest.raises(ValueError):
+        compiler.compile_config(path, output, False)
+    assert files(output) == before
+
+
+def test_cli_prints_generated_paths_and_redacted_summary(tmp_path, customer):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    command = [sys.executable, "-m", "setup.compile_config", "--config", str(path), "--output", str(output)]
+    env = dict(os.environ, GITHUB_TOKEN="ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE")
+    completed = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True)
+
+    assert completed.returncode == 0, completed.stderr
+    for name in ("customer.resources.yml", "runtime_config.json", "summary.json"):
+        assert str(output / name) in completed.stdout
+    for forbidden in ("ENVIRONMENT_CONTENT_MUST_STAY_PRIVATE", "01abc", "acme_catalog", "github.com", "analytics-users", "github-token"):
+        assert forbidden not in completed.stdout + completed.stderr
+    assert json.loads((output / "summary.json").read_text())["demo"] is False
+    demo = subprocess.run(command + ["--demo"], cwd=ROOT, capture_output=True, text=True)
+    assert demo.returncode == 0, demo.stderr
+    assert json.loads((output / "summary.json").read_text())["demo"] is True
+
+
+@pytest.mark.parametrize("bad_yaml", [
+    "token: [REJECTED_CONTENT", "token: REJECTED_CONTENT", "REJECTED_CONTENT: value"
+])
+def test_cli_error_does_not_echo_rejected_input(tmp_path, bad_yaml):
+    path = tmp_path / "customer.yml"
+    path.write_text(bad_yaml)
+    completed = subprocess.run(
+        [sys.executable, "-m", "setup.compile_config", "--config", str(path), "--output", str(tmp_path / ".generated")],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert completed.returncode != 0
+    assert "REJECTED_CONTENT" not in completed.stdout + completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert not (tmp_path / ".generated").exists()
+
+
+@pytest.mark.parametrize("flag", ["--conf", "--profile", "--host"])
+def test_cli_rejects_unsupported_options(tmp_path, customer, flag):
+    path = write_config(tmp_path, customer)
+    output = tmp_path / ".generated"
+    completed = subprocess.run(
+        [sys.executable, "-m", "setup.compile_config", "--config", str(path),
+         "--output", str(output), flag, "REJECTED_CONTENT"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "REJECTED_CONTENT" not in completed.stdout + completed.stderr
+    assert not output.exists()
+
+
+def test_generated_include_resolves_from_resource_directory(compiler, tmp_path, customer):
+    resource_dir = tmp_path / "resources"
+    resource_dir.mkdir()
+    include = resource_dir / "generated.include.yml"
+    shutil.copyfile(ROOT / "resources/generated.include.yml", include)
+    compile_documents(compiler, tmp_path, customer)
+    entries = yaml.safe_load(include.read_text())["include"]
+    assert len(entries) == 1
+    assert (include.parent / entries[0]).resolve() == tmp_path / ".generated/customer.resources.yml"
+    assert (include.parent / entries[0]).is_file()

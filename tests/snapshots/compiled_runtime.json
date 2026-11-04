@@ -1,0 +1,73 @@
+{
+  "customer": {
+    "app_name": "acme-analytics-router",
+    "name": "acme"
+  },
+  "definitions": {
+    "branch": "main",
+    "markdown_path": "definitions",
+    "poll_seconds": 90,
+    "repository_url": "https://github.com/acme/business-definitions.git",
+    "secret_key": "github-token",
+    "secret_scope": "analytics-router"
+  },
+  "genie_agents": [
+    {
+      "description": "Sales pipeline and revenue analytics",
+      "name": "sales",
+      "routing_guidance": "Route sales, pipeline, and revenue questions here",
+      "space_id": "01abc000000000000000000000000001"
+    },
+    {
+      "description": "Customer support analytics",
+      "name": "support",
+      "routing_guidance": "Route support and resolution questions here",
+      "space_id": "01abc000000000000000000000000002"
+    }
+  ],
+  "permissions": {
+    "app": [
+      {
+        "group_name": "analytics-users"
+      }
+    ],
+    "dashboard": [
+      {
+        "user_name": "analyst@example.com"
+      }
+    ]
+  },
+  "routing": {
+    "confidence_threshold": 0.75,
+    "overlap_threshold": 0.7,
+    "prefer_certified_functions": true
+  },
+  "uc_functions": [
+    {
+      "aliases": [
+        "monthly sales",
+        "revenue by month"
+      ],
+      "description": "Certified monthly revenue",
+      "domain": "sales",
+      "full_name": "acme_catalog.metrics.monthly_revenue",
+      "name": "monthly_revenue"
+    },
+    {
+      "aliases": [
+        "time to resolution"
+      ],
+      "description": "Certified average resolution time",
+      "domain": "support",
+      "full_name": "acme_catalog.metrics.resolution_time",
+      "name": "resolution_time"
+    }
+  ],
+  "workspace": {
+    "catalog": "acme_catalog",
+    "classifier_endpoint": "databricks-claude-sonnet-4-5",
+    "mlflow_experiment": "/Shared/acme-analytics-router",
+    "router_schema": "analytics_router",
+    "warehouse_id": "abc123"
+  }
+}

@@ -1,4 +1,5 @@
 .generated/
+.generated-*/
 customer_config/customer.yml
 .env
 .env.*

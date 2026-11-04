@@ -1,0 +1,52 @@
+resources:
+  apps:
+    router_app:
+      name: acme-analytics-router
+      permissions:
+      - group_name: analytics-users
+        level: CAN_USE
+      resources:
+      - name: classifier_endpoint
+        serving_endpoint:
+          name: databricks-claude-sonnet-4-5
+          permission: CAN_QUERY
+      - name: definitions_secret
+        secret:
+          key: github-token
+          permission: READ
+          scope: analytics-router
+      - name: function_monthly_revenue
+        uc_securable:
+          permission: EXECUTE
+          securable_full_name: acme_catalog.metrics.monthly_revenue
+          securable_type: FUNCTION
+      - name: function_resolution_time
+        uc_securable:
+          permission: EXECUTE
+          securable_full_name: acme_catalog.metrics.resolution_time
+          securable_type: FUNCTION
+      - genie_space:
+          name: sales
+          permission: CAN_RUN
+          space_id: 01abc000000000000000000000000001
+        name: genie_sales
+      - genie_space:
+          name: support
+          permission: CAN_RUN
+          space_id: 01abc000000000000000000000000002
+        name: genie_support
+      - name: sql_warehouse
+        sql_warehouse:
+          id: abc123
+          permission: CAN_USE
+      - name: trace_table
+        uc_securable:
+          permission: MODIFY
+          securable_full_name: acme_catalog.analytics_router.routing_traces
+          securable_type: TABLE
+      source_code_path: ../app
+  dashboards:
+    router_dashboard:
+      permissions:
+      - level: CAN_READ
+        user_name: analyst@example.com
