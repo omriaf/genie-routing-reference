@@ -3,7 +3,7 @@
 ## Architecture
 
 One Databricks App exposes the `ask_analytics(question)` MCP tool. It loads
-governed business definitions from private GitHub Markdown, classifies each
+governed business definitions from public or private GitHub Markdown, classifies each
 question once through an existing model serving endpoint, then routes to an
 existing Genie Agent or an explicitly approved Unity Catalog table function.
 Unrecognized domains and undefined metrics return an explicit refusal. Each
@@ -30,9 +30,9 @@ flowchart LR
 | Existing classifier serving endpoint | Rerunnable bootstrap job and explicit App traversal grants |
 | Existing Genie Agent space IDs, data and execution permissions | AI/BI routing dashboard and optional dashboard readers with trace-table read grants |
 | Existing approved UC table functions, or an empty function allowlist | Bundle-managed MLflow experiment and App access to it |
-| Private Markdown repository/branch/folder and existing secret scope/key holding a read-only GitHub credential | Compiled runtime configuration and staged App sources |
+| Markdown repository/branch/folder; for private access, an existing secret scope/key holding a read-only GitHub credential | Compiled runtime configuration and staged App sources |
 
-The DAB references the warehouse, endpoint, Genie Agents, functions, and secret.
+The DAB references the warehouse, endpoint, Genie Agents, functions, and—when private access is selected—the secret.
 It does not create these dependencies. The optional demo supplies synthetic
 SQL and Genie import requests; the installer separately seeds its data and
 creates its agents. Only demo compilation adds a reseeding job.
@@ -41,7 +41,7 @@ creates its agents. Only demo compilation adds a reseeding job.
 
 The installer needs authority to delegate App bindings; the App principal
 receives narrower runtime access. Configuration contains resource references
-and secret scope/key names only. Token values stay in the secret store and
+and optional secret scope/key names only. Token values stay in the secret store and
 must never enter a chat, YAML, terminal transcript, or commit. Traces include
 questions and answers: restrict readers and define retention. Read the
 [security and permission model](docs/SECURITY.md) before granting access.
@@ -62,7 +62,7 @@ you selected explicitly as `--profile "<PROFILE>"`; assistants never choose one.
 All commands run from the cloned repository root unless a step says otherwise.
 
 The public source checkout needs no private GitHub token. Runtime business
-definitions live in a separate private repository. Edit customer settings in
+definitions live in a separate public or private repository. Edit customer settings in
 the ignored `customer_config/customer.yml`; demo settings use the ignored
 `.generated-demo-setup/demo.yml`. Recompile generated files rather than editing
 application or resource code. The [configuration contract](customer_config/README.md)

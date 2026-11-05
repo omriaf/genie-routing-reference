@@ -21,6 +21,7 @@ def valid_config():
             "mlflow_experiment": "/Shared/acme-analytics-router",
         },
         "definitions": {
+            "access": "private",
             "repository_url": "https://github.com/acme/business-definitions.git",
             "branch": "main",
             "markdown_path": "definitions",
@@ -73,6 +74,24 @@ def test_accepts_multiple_agents_and_functions(valid_config):
     assert [function.domain for function in config.uc_functions] == ["sales", "support"]
     assert config.uc_functions[0].full_name == "acme_catalog.metrics.monthly_revenue"
     assert config.routing.prefer_certified_functions is True
+
+
+def test_public_definitions_require_no_secret_reference(valid_config):
+    valid_config["definitions"]["access"] = "public"
+    valid_config["definitions"].pop("secret_scope")
+    valid_config["definitions"].pop("secret_key")
+
+    config = RouterPackageConfig.model_validate(valid_config)
+
+    assert config.definitions.access == "public"
+    assert config.definitions.secret_scope is None
+
+
+def test_private_definitions_require_both_secret_references(valid_config):
+    valid_config["definitions"].pop("secret_key")
+
+    with pytest.raises(ValidationError, match="private.*secret"):
+        RouterPackageConfig.model_validate(valid_config)
 
 
 def test_rejects_duplicate_agent_names(valid_config):

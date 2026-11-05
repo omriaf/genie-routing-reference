@@ -12,6 +12,7 @@ workspace:
   mlflow_experiment: /Shared/acme-analytics-router
 
 definitions:
+  access: private
   repository_url: https://github.com/acme/business-definitions.git
   branch: main
   markdown_path: definitions

@@ -331,6 +331,21 @@ def test_secret_is_reference_only_and_summary_is_sanitized(compiler, tmp_path, c
     assert "github.com" not in json.dumps(summary)
 
 
+def test_public_definitions_create_no_secret_binding(compiler, tmp_path, customer):
+    customer["definitions"]["access"] = "public"
+    customer["definitions"].pop("secret_scope")
+    customer["definitions"].pop("secret_key")
+
+    _, runtime, resource, summary = compile_documents(compiler, tmp_path, customer)
+    bindings = resource["resources"]["apps"]["router_app"]["resources"]
+
+    assert not any("secret" in item for item in bindings)
+    assert runtime["definitions"]["access"] == "public"
+    assert summary["resource_counts"]["secrets"] == 0
+    app_manifest = yaml.safe_load((tmp_path / ".generated/app_source/app.yaml").read_text())
+    assert not any(item.get("name") == "GITHUB_DEFINITIONS_TOKEN" for item in app_manifest["env"])
+
+
 def test_empty_functions_and_permissions_need_no_extra_grants(compiler, tmp_path, customer):
     customer["uc_functions"] = []
     customer.pop("permissions")

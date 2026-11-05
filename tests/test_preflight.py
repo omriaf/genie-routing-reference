@@ -127,6 +127,32 @@ def test_preflight_compiles_and_checks_every_external_reference(preflight, custo
     assert "PASS" in capsys.readouterr().out
 
 
+def test_public_definitions_skip_secret_metadata(preflight, customer_file, tmp_path, monkeypatch):
+    import yaml
+    customer = yaml.safe_load(customer_file.read_text())
+    customer["definitions"]["access"] = "public"
+    customer["definitions"].pop("secret_scope")
+    customer["definitions"].pop("secret_key")
+    customer_file.write_text(yaml.safe_dump(customer))
+    cli = WorkspaceCLI()
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "output"), "--profile", "chosen"]) == 0
+    assert not any(call[1:3] == ["secrets", "list-secrets"] for call in cli.calls)
+    assert not any(call[1:3] == ["secrets", "list-acls"] for call in cli.calls)
+
+
+def test_foundation_model_endpoint_without_id_skips_management_acl(preflight, customer_file, tmp_path, monkeypatch):
+    cli = WorkspaceCLI()
+    cli.overrides[("serving-endpoints", "get")] = {
+        "name": "databricks-claude-sonnet-4-5", "state": {"ready": "READY"}
+    }
+    monkeypatch.setattr(preflight.subprocess, "run", cli)
+
+    assert preflight.main(["--config", str(customer_file), "--output", str(tmp_path / "output"), "--profile", "chosen"]) == 0
+    assert not any(call[1:3] == ["serving-endpoints", "get-permissions"] for call in cli.calls)
+
+
 @pytest.mark.parametrize("denied", [
     ("current-user", "me"), ("warehouses", "get"), ("warehouses", "get-permissions"),
     ("serving-endpoints", "get"), ("serving-endpoints", "get-permissions"),

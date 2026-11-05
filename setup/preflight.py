@@ -169,10 +169,13 @@ def check_workspace(cli: CLI, config: RouterPackageConfig) -> list[str]:
     with _delegation_check("serving endpoint 'classifier_endpoint'", "CAN_MANAGE"):
         endpoint = cli.metadata("serving-endpoints", "get", workspace.classifier_endpoint)
         endpoint_id = endpoint.get("id")
-        if not isinstance(endpoint_id, str) or not endpoint_id:
+        if endpoint.get("name") != workspace.classifier_endpoint:
             raise CheckFailure("model endpoint metadata")
-        _acl(cli.metadata("serving-endpoints", "get-permissions", endpoint_id), principals,
-             {"CAN_MANAGE"})
+        if isinstance(endpoint_id, str) and endpoint_id:
+            _acl(cli.metadata("serving-endpoints", "get-permissions", endpoint_id), principals,
+                 {"CAN_MANAGE"})
+        elif not workspace.classifier_endpoint.startswith("databricks-"):
+            raise CheckFailure("model endpoint metadata")
     for agent in config.genie_agents:
         with _delegation_check(f"Genie Agent '{agent.name}'", "CAN_MANAGE"):
             cli.metadata("genie", "get-space", agent.space_id)
@@ -210,12 +213,13 @@ def check_workspace(cli: CLI, config: RouterPackageConfig) -> list[str]:
             parent = cli.metadata("schemas", "get", function_schema)
         _uc(cli, "schema", function_schema, parent, principals, {"USE_SCHEMA", "MANAGE"})
         _uc(cli, "function", function.full_name, function_metadata, principals, {"EXECUTE", "MANAGE"})
-    with _delegation_check("secret scope 'definitions_secret'", "MANAGE"):
-        _secret_acl(cli.metadata("secrets", "list-acls", config.definitions.secret_scope), principals)
-        secrets = cli.metadata("secrets", "list-secrets", config.definitions.secret_scope)
-        keys = secrets.get("secrets", []) if isinstance(secrets, dict) else secrets
-        if not isinstance(keys, list) or not any(item.get("key") == config.definitions.secret_key for item in keys):
-            raise CheckFailure("Git secret key metadata")
+    if config.definitions.access == "private":
+        with _delegation_check("secret scope 'definitions_secret'", "MANAGE"):
+            _secret_acl(cli.metadata("secrets", "list-acls", config.definitions.secret_scope), principals)
+            secrets = cli.metadata("secrets", "list-secrets", config.definitions.secret_scope)
+            keys = secrets.get("secrets", []) if isinstance(secrets, dict) else secrets
+            if not isinstance(keys, list) or not any(item.get("key") == config.definitions.secret_key for item in keys):
+                raise CheckFailure("Git secret key metadata")
     return notes
 
 
@@ -245,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
     except (AttributeError, KeyError, TypeError):
         print("FAIL: malformed workspace metadata", file=sys.stderr)
         return 1
-    print("PASS: configuration, CLI, auth, resource metadata, installer delegation ACLs, UC permissions, secret key metadata")
+    print("PASS: configuration, CLI, auth, resource metadata, installer delegation ACLs, and UC permissions")
     for note in notes:
         print(f"NOTE: {note}")
     return 0

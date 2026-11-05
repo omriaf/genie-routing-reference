@@ -4,6 +4,7 @@
     "name": "acme"
   },
   "definitions": {
+    "access": "private",
     "branch": "main",
     "markdown_path": "definitions",
     "poll_seconds": 90,

@@ -29,12 +29,16 @@ class FakeGitHub:
         self.failures = []
         self.override_listing = None
         self.before_get = None
+        self.expected_auth = True
 
     def get(self, url, *, headers, timeout):
         from app.definitions import GitHubResponse
 
         assert url.startswith(API + "/") or url.startswith(API + "?")
-        assert headers["Authorization"] == "Bearer " + TOKEN
+        if self.expected_auth:
+            assert headers["Authorization"] == "Bearer " + TOKEN
+        else:
+            assert "Authorization" not in headers
         assert 0 < timeout <= 30
         self.calls.append(url)
         if self.before_get:
@@ -109,6 +113,21 @@ def test_initial_load_uses_bound_token_and_commit_pinned_api_only(store_setup):
         assert len(github.calls) == 3
     finally:
         store.stop()
+
+
+def test_public_repository_uses_anonymous_github_requests(modules, runtime_document, install_runtime, monkeypatch):
+    monkeypatch.delenv("GITHUB_DEFINITIONS_TOKEN", raising=False)
+    runtime_document["definitions"]["access"] = "public"
+    runtime_document["definitions"].pop("secret_scope")
+    runtime_document["definitions"].pop("secret_key")
+    runtime = install_runtime(runtime_document)
+    transport = FakeGitHub()
+    transport.expected_auth = False
+
+    store = modules.definitions.DefinitionsStore(runtime, transport=transport, retry_delay_seconds=0)
+
+    assert store.refresh() is True
+    assert store.snapshot().revision == SHA1
 
 
 def test_unchanged_revision_retains_snapshot_identity_without_content_fetch(store_setup):

@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 import yaml
 from pydantic import (
@@ -72,12 +72,22 @@ class WorkspaceConfig(StrictConfigModel):
 
 
 class DefinitionsConfig(StrictConfigModel):
+    access: Literal["public", "private"] = "private"
     repository_url: NonBlank
     branch: NonBlank
     markdown_path: NonBlank
-    secret_scope: SecretIdentifier
-    secret_key: SecretIdentifier
+    secret_scope: SecretIdentifier | None = None
+    secret_key: SecretIdentifier | None = None
     poll_seconds: Annotated[int, Field(gt=0)]
+
+    @model_validator(mode="after")
+    def credential_matches_access(self) -> Self:
+        supplied = self.secret_scope is not None or self.secret_key is not None
+        if self.access == "private" and (self.secret_scope is None or self.secret_key is None):
+            raise ValueError("private definitions require both secret references")
+        if self.access == "public" and supplied:
+            raise ValueError("public definitions must not include secret references")
+        return self
 
     @field_validator("repository_url")
     @classmethod

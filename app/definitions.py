@@ -1,9 +1,7 @@
-"""Private GitHub HTTPS loading with atomic, commit-pinned definition refreshes.
+"""GitHub HTTPS loading with atomic, commit-pinned definition refreshes.
 
-App lifespan: construct DefinitionsStore(runtime), start() before readiness,
-use snapshot()/health(), and stop() on shutdown. The App secret resource must
-bind GITHUB_DEFINITIONS_TOKEN (or the explicit token_env variable). Importing
-performs no I/O. The bound token is read only when preparing an API request.
+Private repositories bind GITHUB_DEFINITIONS_TOKEN; public repositories make
+anonymous requests. Importing performs no I/O.
 
 refresh() is synchronous and serialized, returning success/failure. Readers use
 only a short state lock; every candidate is downloaded and validated off-lock.
@@ -214,12 +212,16 @@ class DefinitionsStore:
         # Read the bound environment only after URL validation; never store a
         # token in an instance repr, exception, health response, or log message.
         token = os.environ.get(self._token_env, "")
-        if not token.strip() or any(ord(character) < 32 or ord(character) == 127 for character in token):
+        if self._settings.access == "private" and (
+            not token.strip() or any(ord(character) < 32 or ord(character) == 127 for character in token)
+        ):
             raise DefinitionsError("GitHub definitions credential is unavailable")
         headers = {
-            "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+            "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "genie-routing-reference",
         }
+        if self._settings.access == "private":
+            headers["Authorization"] = "Bearer " + token
         for attempt in range(self._max_attempts):
             if self._stop.is_set():
                 break

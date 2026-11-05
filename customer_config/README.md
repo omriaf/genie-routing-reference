@@ -41,18 +41,20 @@ preserved exactly; functions must use the same catalog spelling as
 
 | Field | Meaning and validation |
 | --- | --- |
-| `definitions.repository_url` | HTTPS `github.com/owner/repository` URL, optionally ending in `.git`. Credentials, query strings, fragments, ports, and subfolder URLs are rejected. Reference your private definitions repository. |
+| `definitions.access` | `private` to use a bound GitHub token, or `public` for anonymous read-only GitHub API access. |
+| `definitions.repository_url` | HTTPS `github.com/owner/repository` URL, optionally ending in `.git`. Credentials, query strings, fragments, ports, and subfolder URLs are rejected. |
 | `definitions.branch` | Nonblank branch name to poll. |
 | `definitions.markdown_path` | Repository-relative Markdown folder, such as `definitions` or `definitions/metrics`; `.` means repository root. Absolute paths, empty components, backslashes, and traversal are rejected. |
-| `definitions.secret_scope` | Name of an existing Databricks secret scope. |
-| `definitions.secret_key` | Key of the existing secret containing the read-only GitHub token. This is the key name, never the token value. |
+| `definitions.secret_scope` | For `private` access, name of an existing Databricks secret scope. Omit for `public`. |
+| `definitions.secret_key` | For `private` access, key containing the read-only GitHub token. Omit for `public`. |
 | `definitions.poll_seconds` | Positive integer refresh interval in seconds; for example `90`. |
 
 Secret scope and key identifiers allow letters, digits, `_`, `-`, `.`, and `@`,
 up to 128 characters. Create the secret separately using your organization's
 credential process. The runtime will use a resource binding to access the
-secret; this configuration loader never retrieves it. Use a read-only GitHub
-credential restricted to the definitions repository.
+secret; this configuration loader never retrieves it. For private access, use
+a read-only GitHub credential restricted to the definitions repository. Public
+access creates no secret binding and sends no Authorization header.
 
 Never put tokens, passwords, private keys, or other secret values in YAML,
 examples, tests, logs, generated files, or commits. Fields such as `token`,

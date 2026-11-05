@@ -186,14 +186,6 @@ def _resource_document(runtime: dict, demo_resources: dict, output_dir: Path) ->
             },
         },
         {
-            "name": "definitions_secret",
-            "secret": {
-                "scope": definitions["secret_scope"],
-                "key": definitions["secret_key"],
-                "permission": "READ",
-            },
-        },
-        {
             "name": "mlflow_experiment",
             "experiment": {
                 "experiment_id": "${resources.experiments.router_experiment.id}",
@@ -201,6 +193,15 @@ def _resource_document(runtime: dict, demo_resources: dict, output_dir: Path) ->
             },
         },
     ]
+    if definitions["access"] == "private":
+        bindings.append({
+            "name": "definitions_secret",
+            "secret": {
+                "scope": definitions["secret_scope"],
+                "key": definitions["secret_key"],
+                "permission": "READ",
+            },
+        })
     bindings.extend(
         {
             "name": f"genie_{agent['name']}",
@@ -309,7 +310,7 @@ def _resource_summary(runtime: dict, demo: bool, demo_resources: dict) -> dict:
         },
         "resource_counts": {
             "genie_spaces": len(runtime["genie_agents"]),
-            "secrets": 1,
+            "secrets": int(runtime["definitions"]["access"] == "private"),
             "serving_endpoints": 1,
             "sql_warehouses": 1,
             "trace_tables": 1,
@@ -323,7 +324,7 @@ def _resource_summary(runtime: dict, demo: bool, demo_resources: dict) -> dict:
     return summary
 
 
-def _stage_app(staging: Path) -> dict[str, bytes]:
+def _stage_app(staging: Path, runtime: dict) -> dict[str, bytes]:
     """Copy only the deployed runtime, never an entire checkout or source folder."""
     sources = {f"app/{name}": _APP_SOURCE_DIR / name for name in _APP_MODULES}
     sources.update({
@@ -340,6 +341,13 @@ def _stage_app(staging: Path) -> dict[str, bytes]:
             raise ValueError("Required App source is missing or is a symlink")
         payload[name] = source.read_bytes()
     payload["runtime_config.json"] = (staging / "runtime_config.json").read_bytes()
+    if runtime["definitions"]["access"] == "public":
+        manifest = yaml.load(payload["app.yaml"], Loader=_UniqueKeySafeLoader)
+        manifest["env"] = [
+            item for item in manifest.get("env", [])
+            if item.get("name") != "GITHUB_DEFINITIONS_TOKEN"
+        ]
+        payload["app.yaml"] = yaml.safe_dump(manifest, sort_keys=False).encode("utf-8")
     for name, data in sorted(payload.items()):
         destination = staging / "app_source" / name
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -447,7 +455,7 @@ def compile_config(config_path: Path, output_dir: Path, demo: bool) -> CompileRe
         except TemplateError:
             raise ValueError("Configuration template rendering failed") from None
         (staging / "summary.json").write_text(_json_text(summary), encoding="utf-8")
-        app_files = _stage_app(staging)
+        app_files = _stage_app(staging, runtime)
         _validate_artifacts(staging, runtime, resources, summary, app_files)
         # Recheck immediately before publication as well as before staging.
         _output_destination(config_path, output)
