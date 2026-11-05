@@ -5,6 +5,8 @@ MCP tool and selects an existing Genie Agent or an allowlisted Unity Catalog
 function for each analytics question. Routing evidence is written to Delta and
 MLflow and visualized in an AI/BI dashboard.
 
+> **Disclaimer:** This project is a demo and a starting point. Teams adopting it can adapt it to their needs and are responsible for validating their setup and tracking usage, performance, and costs.
+
 ## Quick start
 
 Clone the repository, configure your existing Databricks resources, and run the
