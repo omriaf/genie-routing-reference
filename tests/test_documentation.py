@@ -171,7 +171,7 @@ def test_customer_smoke_without_function_match_preserves_genie_and_refusal_polic
 def test_readme_explains_architecture_ownership_and_choice_before_installation():
     document = read("README.md")
     decision = document.index("docs/INSTALL_DEMO.md")
-    for required in ("architecture", "customer supplies", "DAB creates", "security"):
+    for required in ("architecture", "you provide", "DAB creates", "security"):
         assert required.casefold() in document[:decision].casefold()
     assert "docs/INSTALL_CUSTOMER.md" in document
     assert "docs/AI_ASSISTED_INSTALL.md" in document
@@ -182,6 +182,14 @@ def test_readme_and_ai_handoff_use_the_one_command_installer():
         document = read(relative)
         assert "./install.sh --profile \"<PROFILE>\"" in document
     assert "customer_config/customer.yml" in read("README.md")
+
+
+def test_public_readme_addresses_the_installer_not_an_internal_sender():
+    introduction = read("README.md")[:1200].casefold()
+    assert "send the customer" not in introduction
+    assert "clone" in introduction
+    assert "configure" in introduction
+    assert "install" in introduction
 
 
 @pytest.mark.parametrize("relative", ("docs/INSTALL_CUSTOMER.md", "docs/INSTALL_DEMO.md"))

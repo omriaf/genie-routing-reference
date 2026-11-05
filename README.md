@@ -1,13 +1,20 @@
-# Genie routing reference
+# Genie Routing Reference
 
-## Fastest customer installation
+Deploy a governed analytics router as a Databricks App. The router exposes one
+MCP tool and selects an existing Genie Agent or an allowlisted Unity Catalog
+function for each analytics question. Routing evidence is written to Delta and
+MLflow and visualized in an AI/BI dashboard.
 
-Send the customer this Git repository. After cloning it, they create their
-ignored configuration and run one command:
+## Quick start
+
+Clone the repository, configure your existing Databricks resources, and run the
+guarded installer:
 
 ```bash
+git clone https://github.com/omriaf/genie-routing-reference.git
+cd genie-routing-reference
 cp customer_config/customer.example.yml customer_config/customer.yml
-# Edit customer_config/customer.yml with existing workspace resources.
+# Configure customer_config/customer.yml with your workspace resources.
 ./install.sh --profile "<PROFILE>"
 ```
 
@@ -40,9 +47,9 @@ flowchart LR
   Traces --> Dashboard[AI/BI dashboard]
 ```
 
-## What the customer supplies and the DAB creates
+## What you provide and what the DAB creates
 
-| Customer supplies | DAB creates / package initializes |
+| You provide | DAB creates / package initializes |
 | --- | --- |
 | Explicitly selected CLI profile and deployment authority | Router App and its service principal, resource bindings and optional App readers |
 | Existing catalog and Pro or Serverless SQL warehouse | Dedicated router schema and Delta `routing_traces` table through bootstrap SQL |
@@ -70,7 +77,7 @@ questions and answers: restrict readers and define retention. Read the
 | Your starting point | Follow |
 | --- | --- |
 | Evaluate with synthetic retail, support and marketing data in a dedicated schema | [Demo installation](docs/INSTALL_DEMO.md) |
-| Route against your existing Genie Agents, governed definitions and approved functions | [Existing customer data installation](docs/INSTALL_CUSTOMER.md) |
+| Route against your existing Genie Agents, governed definitions and approved functions | [Existing data installation](docs/INSTALL_CUSTOMER.md) |
 | Give an assistant the public repository URL and install interactively | [AI-assisted installation](docs/AI_ASSISTED_INSTALL.md), governed by [AGENTS.md](AGENTS.md) |
 
 Five minutes is the decision time; workspace provisioning and approvals take
@@ -81,7 +88,7 @@ you selected explicitly as `--profile "<PROFILE>"`; assistants never choose one.
 All commands run from the cloned repository root unless a step says otherwise.
 
 The public source checkout needs no private GitHub token. Runtime business
-definitions live in a separate public or private repository. Edit customer settings in
+definitions live in a separate public or private repository. Edit deployment settings in
 the ignored `customer_config/customer.yml`; demo settings use the ignored
 `.generated-demo-setup/demo.yml`. Recompile generated files rather than editing
 application or resource code. The [configuration contract](customer_config/README.md)
