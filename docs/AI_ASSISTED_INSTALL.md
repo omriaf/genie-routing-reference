@@ -26,6 +26,18 @@ Require separate explicit approval before any destroy or other destructive actio
 After approved deployment, run the documented smoke checks and report evidence.
 ```
 
+For the customer-data path, once the ignored configuration is complete, use the
+repository's guarded installer rather than reproducing its commands manually:
+
+```bash
+./install.sh --profile "<PROFILE>"
+```
+
+The installer performs compile, preflight and strict validation before showing
+the redacted plan. It pauses for deployment approval unless the human explicitly
+reruns it with `--yes`. The assistant must still follow the smoke-test and
+cleanup sections in the customer guide after installation.
+
 For the demo path, replace `customer-data` with `demo` and the customer guide
 with `docs/INSTALL_DEMO.md`. The assistant must prepare/import using that guide,
 obtain separate approval for demo DDL/agent creation, insert actual returned

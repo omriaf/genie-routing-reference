@@ -177,6 +177,13 @@ def test_readme_explains_architecture_ownership_and_choice_before_installation()
     assert "docs/AI_ASSISTED_INSTALL.md" in document
 
 
+def test_readme_and_ai_handoff_use_the_one_command_installer():
+    for relative in ("README.md", "docs/AI_ASSISTED_INSTALL.md"):
+        document = read(relative)
+        assert "./install.sh --profile \"<PROFILE>\"" in document
+    assert "customer_config/customer.yml" in read("README.md")
+
+
 @pytest.mark.parametrize("relative", ("docs/INSTALL_CUSTOMER.md", "docs/INSTALL_DEMO.md"))
 def test_installation_orders_validation_approval_and_mutations(relative):
     document = read(relative)

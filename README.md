@@ -1,5 +1,24 @@
 # Genie routing reference
 
+## Fastest customer installation
+
+Send the customer this Git repository. After cloning it, they create their
+ignored configuration and run one command:
+
+```bash
+cp customer_config/customer.example.yml customer_config/customer.yml
+# Edit customer_config/customer.yml with existing workspace resources.
+./install.sh --profile "<PROFILE>"
+```
+
+The installer prepares pinned dependencies, compiles the configuration, runs
+metadata preflight and strict DAB validation, and displays a redacted summary.
+It asks for confirmation before any workspace write, then bootstraps, deploys,
+starts the App and prints the bundle links. Prerequisites are Python 3.11+,
+[`uv`](https://docs.astral.sh/uv/), Databricks CLI 1.0+, and an explicitly
+configured CLI profile. See [customer installation](docs/INSTALL_CUSTOMER.md)
+for prerequisites and post-install smoke tests.
+
 ## Architecture
 
 One Databricks App exposes the `ask_analytics(question)` MCP tool. It loads
@@ -13,7 +32,7 @@ the trace table.
 ```mermaid
 flowchart LR
   Client[MCP client] --> App[Router App]
-  Git[Private GitHub Markdown] --> App
+  Git[Public or private GitHub Markdown] --> App
   App --> Model[Classifier endpoint]
   App --> Genie[Existing Genie Agents]
   App --> UC[Approved UC functions]
